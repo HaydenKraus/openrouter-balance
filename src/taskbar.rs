@@ -62,9 +62,27 @@ pub enum ShellEvent {
 
 /// Сообщение «в очереди есть команда» (в тот же поток, тому же скрытому окну).
 const WM_APP_COMMAND: u32 = WM_APP + 1;
-/// Размер иконки трея (32; оверлей панели задач — 16).
+/// Запасной размер иконки трея, если DPI узнать не удалось (оверлей панели задач — 16).
 const TRAY_ICON_SIZE: u32 = 32;
 const OVERLAY_ICON_SIZE: u32 = 16;
+
+/// Реальный размер иконки в трее: 16 px при 100%, 24 при 150%, 32 при 200%.
+/// Рисуем сразу в нём, чтобы Windows не сжимала 32×32 (при 150% — с размытием).
+/// DPI берётся у панели задач, поэтому смена масштаба учитывается без перезапуска.
+fn tray_icon_size() -> u32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SM_CXSMICON};
+    unsafe {
+        let dpi = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())
+            .map(|h| GetDpiForWindow(h))
+            .unwrap_or(0);
+        let dpi = if dpi == 0 { GetDpiForSystem() } else { dpi };
+        match GetSystemMetricsForDpi(SM_CXSMICON, dpi) {
+            s if s > 0 => (s as u32).clamp(16, 64),
+            _ => TRAY_ICON_SIZE,
+        }
+    }
+}
 /// Лимит тултипа трея: 127 символов + завершающий ноль.
 const TIP_MAX_CHARS: usize = 127;
 /// Таймаут ожидания завершения потока в `shutdown`.
@@ -339,7 +357,10 @@ const TRAY_FONTS: [&str; 7] = [
 ];
 /// Тёмный контур вокруг цифр (для читаемости и на тёмной, и на светлой панели).
 /// Просвет между строками цифр, px.
-const TRAY_GAP: i32 = 3;
+/// Просвет между строками: 3 px на 32, 2 px на 24, 1 px на 16.
+fn tray_gap(size: i32) -> i32 {
+    (size * 3 / 32).max(1)
+}
 const TRAY_OUTLINE: [u8; 3] = [0, 0, 0];
 const TRAY_OUTLINE_ALPHA: f64 = 0.88;
 /// Цвет цифр в трее: всегда белый, уровень цветом не кодируется.
@@ -569,6 +590,7 @@ fn fit_font(hdc: HDC, face: &str, lines: &[String], size: i32) -> Option<FittedF
     let limit_w = (size - 2).max(1);
     let rows = lines.len() as i32;
     let limit_h = size.max(1);
+    let gap = tray_gap(size);
     // Ячейку берём с запасом: чернила цифр занимают лишь часть tmHeight.
     let cap = (size * 3).clamp(5, 300);
     let mut best: Option<(i32, FittedFont)> = None;
@@ -589,11 +611,11 @@ fn fit_font(hdc: HDC, face: &str, lines: &[String], size: i32) -> Option<FittedF
                 line_h: ink_h,
             };
             // Влезает: строки стоят стопкой, между ними 1 px просвета.
-            if text_w <= limit_w && ink_h * rows + (rows - 1) * TRAY_GAP <= limit_h {
+            if text_w <= limit_w && ink_h * rows + (rows - 1) * gap <= limit_h {
                 return Some(font);
             }
             // Запасной вариант — самая крупная высота чернил, что ещё влезает.
-            if ink_h * rows + (rows - 1) * TRAY_GAP <= limit_h && best.is_none_or(|(h, _)| ink_h > h) {
+            if ink_h * rows + (rows - 1) * gap <= limit_h && best.is_none_or(|(h, _)| ink_h > h) {
                 best = Some((ink_h, font));
             }
         }
@@ -710,7 +732,7 @@ fn draw_lines_mask(
                     drawn = false;
                     break;
                 }
-                y += fit.line_h + TRAY_GAP;
+                y += fit.line_h + tray_gap(dim);
             }
             if drawn {
                 // ИНВАРИАНТ: bits указывает на буфер DIB ровно stride*dim байт.
@@ -733,7 +755,7 @@ fn draw_lines_mask(
                             drawn = false;
                             break;
                         }
-                        y += fit.line_h + TRAY_GAP;
+                        y += fit.line_h + tray_gap(dim);
                     }
                 }
             }
@@ -1084,7 +1106,7 @@ struct TrayState {
     taskbar: Option<ITaskbarList3>,
     last_model: Option<TaskbarModel>,
     /// Последняя нарисованная иконка трея (чтобы не перерисовывать зря).
-    last_icon: Option<Vec<String>>,
+    last_icon: Option<(u32, Vec<String>)>,
     /// Последняя установленная HICON оверлея (уничтожается при замене).
     overlay_icon: Option<HICON>,
     /// Поток, который повторно применит прогресс через ~300 мс после показа окна.
@@ -1163,12 +1185,13 @@ impl TrayState {
     }
 
     fn apply_model(&mut self, model: TaskbarModel) {
-        // (1) иконка трея — только при смене строк (цвет всегда белый).
-        let key = model.tray_lines.clone();
+        // (1) иконка трея — только при смене строк или масштаба экрана (цвет всегда белый).
+        let size = tray_icon_size();
+        let key = (size, model.tray_lines.clone());
         if self.last_icon.as_ref() != Some(&key) {
             if let Some(tray) = &self.tray {
-                let rgba = render_tray_icon_rgba(TRAY_ICON_SIZE, &model.tray_lines, TRAY_WHITE);
-                if let Ok(icon) = Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE) {
+                let rgba = render_tray_icon_rgba(size, &model.tray_lines, TRAY_WHITE);
+                if let Ok(icon) = Icon::from_rgba(rgba, size, size) {
                     let _ = tray.set_icon(Some(icon));
                     self.last_icon = Some(key);
                 }
@@ -1454,10 +1477,11 @@ fn run_tray_thread(
     }
 
     // Иконка трея создаётся в этом потоке (иначе трей не работает без цикла сообщений).
+    let initial_size = tray_icon_size();
     let initial_icon = Icon::from_rgba(
-        render_tray_icon_rgba(TRAY_ICON_SIZE, &["…".to_string()], TRAY_WHITE),
-        TRAY_ICON_SIZE,
-        TRAY_ICON_SIZE,
+        render_tray_icon_rgba(initial_size, &["…".to_string()], TRAY_WHITE),
+        initial_size,
+        initial_size,
     )
     .ok();
     let mut tray_builder = TrayIcon::builder()
@@ -1470,7 +1494,7 @@ fn run_tray_thread(
     match tray_builder.build() {
         Ok(tray) => {
             state.tray = Some(tray);
-            state.last_icon = Some(vec!["…".to_string()]);
+            state.last_icon = Some((initial_size, vec!["…".to_string()]));
         }
         Err(e) => {
             let _ = ready.send(Err(format!("не удалось создать иконку трея: {e}")));
@@ -2233,8 +2257,9 @@ mod tests {
         use std::io::Write;
         let dir = std::env::temp_dir().join("orb-tray-preview");
         let _ = std::fs::create_dir_all(&dir);
-        let samples: [(&str, Vec<String>); 7] = [
+        let samples: [(&str, Vec<String>); 8] = [
             ("12.53", lines(&["12.53"])),
+            ("minus3", lines(&["-3.00"])),
             ("0.85", lines(&["0.85"])),
             ("999.99", lines(&["999.99"])),
             ("1235", lines(&["1235"])),
@@ -2255,10 +2280,16 @@ mod tests {
             for (bg_name, bg) in [("gray", [128u8, 128, 128]), ("white", [255u8, 255, 255])] {
                 let composed = compose_on(&icon, 32, bg);
                 let small = compose_on(&downscale_half(&icon, 32), 16, bg);
+                // Нативная отрисовка под 16 и 24 px (как в трее при 100% и 150%).
+                let n16 = compose_on(&render_tray_icon_rgba(16, &ls, TRAY_WHITE), 16, bg);
+                let n24 = compose_on(&render_tray_icon_rgba(24, &ls, TRAY_WHITE), 24, bg);
                 for (suffix, size, rgba) in [
                     ("32", 32u32, composed.clone()),
-                    ("16", 16u32, small),
+                    ("16", 16u32, small.clone()),
                     ("32x8", 256u32, upscale(&composed, 32, 8)),
+                    ("16x8", 128u32, upscale(&small, 16, 8)),
+                    ("n16x8", 128u32, upscale(&n16, 16, 8)),
+                    ("n24x8", 192u32, upscale(&n24, 24, 8)),
                 ] {
                     let path = dir.join(format!("{name}_{bg_name}_{suffix}.png"));
                     if std::fs::File::create(&path)

@@ -28,6 +28,16 @@ pub fn spent_pct(limit: Option<f64>, usage: f64) -> Option<f64> {
     }
 }
 
+/// Потрачено из лимита в текущем периоде: `limit − limit_remaining`.
+/// Так полоса совпадает с цветом трея, даже если лимит сбрасывается по периоду
+/// (`usage` — расход за всё время). Без `limit_remaining` — `usage`.
+pub fn period_spent(key: &KeyInfo) -> f64 {
+    match (key.limit, key.limit_remaining) {
+        (Some(l), Some(r)) => l - r,
+        _ => key.usage,
+    }
+}
+
 /// Подпись прогресс-бара: «Потрачено $X из $Y (Z%)».
 pub fn spent_caption(limit: Option<f64>, usage: f64) -> String {
     match (limit, spent_pct(limit, usage)) {
@@ -150,6 +160,8 @@ pub fn tray_source_can_uncheck(selected: usize, src_on: bool) -> bool {
 struct SettingsDraft {
     cfg: Config,
     mgmt: String,
+    /// Нажата «Удалить management-ключ»; применяется по «Сохранить».
+    remove_mgmt: bool,
     error: Option<String>,
 }
 
@@ -181,6 +193,7 @@ impl App {
         self.settings = Some(SettingsDraft {
             cfg: self.core.config(),
             mgmt: String::new(),
+            remove_mgmt: false,
             error: None,
         });
     }
@@ -327,7 +340,8 @@ impl App {
     }
 
     fn limit_bar(&self, ui: &mut egui::Ui, key: &KeyInfo, level: Level) {
-        match spent_pct(key.limit, key.usage) {
+        let spent = period_spent(key);
+        match spent_pct(key.limit, spent) {
             Some(pct) => {
                 let bar = egui::ProgressBar::new((pct / 100.0) as f32)
                     .desired_width(ui.available_width())
@@ -336,7 +350,7 @@ impl App {
                     .animate(false);
                 ui.add(bar);
                 ui.add_space(2.0);
-                ui.label(RichText::new(spent_caption(key.limit, key.usage)).strong());
+                ui.label(RichText::new(spent_caption(key.limit, spent)).strong());
             }
             None => {
                 ui.label(RichText::new("Лимит: без лимита").weak());
@@ -453,7 +467,6 @@ impl App {
             return;
         };
         let mut close = false;
-        let mut remove_key = false;
         // Иконка действия для `MgmtKeyChange`: `1` задать новый ключ, иначе не менять/удалить.
         let mut action: i8 = 0;
 
@@ -572,9 +585,12 @@ impl App {
                         .desired_width(f32::INFINITY),
                 );
                 ui.horizontal(|ui| {
-                    if state.has_management_key && ui.button("Удалить management-ключ").clicked()
+                    if draft.remove_mgmt {
+                        ui.label(RichText::new("ключ будет удалён после «Сохранить»").small());
+                    } else if state.has_management_key
+                        && ui.button("Удалить management-ключ").clicked()
                     {
-                        remove_key = true;
+                        draft.remove_mgmt = true;
                         draft.mgmt.clear();
                     }
                 });
@@ -605,10 +621,11 @@ impl App {
             return;
         }
 
-        let change = if remove_key {
-            MgmtKeyChange::Clear
-        } else if action == 1 {
+        // Введённый новый ключ важнее нажатого ранее «Удалить».
+        let change = if action == 1 {
             MgmtKeyChange::Set(draft.mgmt.trim().to_string())
+        } else if draft.remove_mgmt {
+            MgmtKeyChange::Clear
         } else {
             MgmtKeyChange::Keep
         };
@@ -726,6 +743,15 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn period_spent_uses_remaining_when_known() {
+        // Лимит сбрасывается по периоду: за всё время $90, в этом периоде $10.
+        assert_eq!(period_spent(&key(Some(50.0), Some(40.0), 90.0)), 10.0);
+        // Остаток неизвестен — расход за всё время.
+        assert_eq!(period_spent(&key(Some(50.0), None, 12.5)), 12.5);
+        assert_eq!(period_spent(&key(None, None, 7.0)), 7.0);
     }
 
     #[test]

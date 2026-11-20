@@ -187,18 +187,24 @@ fn fallback_value(snap: &Snapshot) -> Option<f64> {
 }
 
 /// Полная сумма для иконки трея без знака валюты: `12.53`, `0.85`, `1234`, `12k`.
-/// Отрицательные и нечисловые значения → `0.00` / `?`.
+/// Отрицательные (долг, перерасход) — со знаком минус: `-2.50`. Нечисловые → `?`.
 pub fn tray_amount(v: f64) -> String {
     if !v.is_finite() {
         return "?".to_string();
     }
-    let v = v.max(0.0);
-    if v < 1000.0 {
-        format!("{v:.2}")
-    } else if v < 100_000.0 {
-        format!("{v:.0}")
+    let a = v.abs();
+    let s = if a < 1000.0 {
+        format!("{a:.2}")
+    } else if a < 100_000.0 {
+        format!("{a:.0}")
     } else {
-        format!("{}k", (v / 1000.0).round().min(9999.0))
+        format!("{}k", (a / 1000.0).round().min(9999.0))
+    };
+    // «-0.00» не показываем
+    if v < 0.0 && s != "0.00" {
+        format!("-{s}")
+    } else {
+        s
     }
 }
 pub fn format_time(t: SystemTime) -> String {
@@ -623,7 +629,9 @@ mod tests {
     fn tray_amount_formats() {
         assert_eq!(tray_amount(12.534), "12.53");
         assert_eq!(tray_amount(0.0), "0.00");
-        assert_eq!(tray_amount(-3.0), "0.00");
+        assert_eq!(tray_amount(-3.0), "-3.00");
+        assert_eq!(tray_amount(-0.001), "0.00");
+        assert_eq!(tray_amount(-1500.0), "-1500");
         assert_eq!(tray_amount(999.994), "999.99");
         assert_eq!(tray_amount(1234.56), "1235");
         assert_eq!(tray_amount(250_000.0), "250k");

@@ -21,6 +21,8 @@ use crate::taskbar::{self, Shell};
 
 /// После ошибки пробуем снова не реже, чем через столько секунд.
 const ERROR_RETRY_SECS: u64 = 20;
+/// Потолок паузы при ошибках подряд (нет сети, 429): 10 минут.
+const ERROR_MAX_WAIT_SECS: u64 = 600;
 
 /// Изменение management-ключа в настройках.
 pub enum MgmtKeyChange {
@@ -346,6 +348,11 @@ impl Core {
             self.fail_login("Введите API-ключ".into());
             return;
         }
+        // Идущий OAuth-вход (или прошлая проверка ключа) отменяется, иначе он
+        // позже завершится и подменит введённый вручную ключ.
+        if let Some(h) = lock(&self.login_task).take() {
+            h.abort();
+        }
         {
             let mut st = lock(&self.state);
             st.phase = AuthPhase::LoggingIn;
@@ -481,6 +488,8 @@ impl Core {
     async fn refresh_loop(self: Arc<Self>) {
         // Первое обновление сразу, если вход уже выполнен.
         let mut forced = true;
+        // Ошибок подряд — для нарастающей паузы между попытками.
+        let mut failures: u32 = 0;
         loop {
             let (signed_in, unauthorized) = {
                 let st = lock(&self.state);
@@ -491,10 +500,15 @@ impl Core {
             };
             if signed_in && (forced || !unauthorized) {
                 self.refresh_once().await;
+                if lock(&self.state).error.is_some() {
+                    failures = failures.saturating_add(1);
+                } else {
+                    failures = 0;
+                }
             }
             let cfg_secs = lock(&self.config).refresh_secs;
             let wait = if lock(&self.state).error.is_some() {
-                cfg_secs.min(ERROR_RETRY_SECS)
+                error_wait_secs(cfg_secs, failures)
             } else {
                 cfg_secs
             };
@@ -545,6 +559,14 @@ impl Core {
     }
 }
 
+/// Пауза после `failures` ошибок подряд: первая как раньше (≤20 с),
+/// дальше удваивается до потолка `ERROR_MAX_WAIT_SECS`.
+fn error_wait_secs(cfg_secs: u64, failures: u32) -> u64 {
+    let first = cfg_secs.min(ERROR_RETRY_SECS);
+    let shift = failures.saturating_sub(1).min(10);
+    (first << shift).min(ERROR_MAX_WAIT_SECS.max(first))
+}
+
 fn low_balance_text(key: &KeyInfo, pct: Option<f64>) -> String {
     let rem = crate::format::key_remaining(key)
         .map(money)
@@ -569,6 +591,18 @@ fn show_toast(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_wait_grows_and_caps() {
+        assert_eq!(error_wait_secs(60, 1), 20);
+        assert_eq!(error_wait_secs(60, 2), 40);
+        assert_eq!(error_wait_secs(60, 3), 80);
+        assert_eq!(error_wait_secs(60, 6), 600);
+        assert_eq!(error_wait_secs(60, 1000), 600);
+        // короткий интервал из настроек — начинаем с него
+        assert_eq!(error_wait_secs(5, 1), 5);
+        assert_eq!(error_wait_secs(5, 0), 5);
+    }
 
     #[test]
     fn notify_once_per_crossing() {
