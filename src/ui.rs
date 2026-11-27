@@ -124,9 +124,14 @@ pub fn tray_source_enabled(selected: usize, src_on: bool) -> bool {
     src_on || selected < MAX_TRAY_SOURCES
 }
 
-/// Последний выбранный источник снять нельзя: хотя бы один остаётся.
-pub fn tray_source_can_uncheck(selected: usize, src_on: bool) -> bool {
-    src_on && selected > 1
+/// Можно ли применить клик по галочке источника: включить — пока есть место,
+/// снять — пока остаётся хотя бы один источник.
+pub fn tray_click_allowed(selected: usize, wanted_on: bool) -> bool {
+    if wanted_on {
+        selected < MAX_TRAY_SOURCES
+    } else {
+        selected > 1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,12 +576,10 @@ impl App {
                     if ui
                         .add_enabled(enabled, egui::Checkbox::new(&mut on, src.label()))
                         .changed()
+                        && tray_click_allowed(selected, on)
                     {
-                        // Снять последний выбранный чекбокс нельзя — оставляем как было.
-                        let allow = !on || tray_source_can_uncheck(selected, true);
-                        if allow {
-                            toggle_tray_source(&mut sources, src, on);
-                        }
+                        // `on` — состояние после клика; ограничения проверены выше.
+                        toggle_tray_source(&mut sources, src, on);
                     }
                     if src == TraySource::AccountBalance && !state.has_management_key {
                         ui.label(
@@ -947,8 +950,20 @@ mod tests {
         let mut list = vec![TraySource::KeyRemaining];
         toggle_tray_source(&mut list, TraySource::KeyRemaining, false);
         assert_eq!(list, vec![TraySource::KeyRemaining]);
-        assert!(!tray_source_can_uncheck(1, true));
-        assert!(tray_source_can_uncheck(2, true));
+        assert!(!tray_click_allowed(1, false));
+        assert!(tray_click_allowed(2, false));
+    }
+
+    #[test]
+    fn tray_checkbox_click_applies_second_source() {
+        // Дефолт — один источник; включение второго должно применяться (регрессия:
+        // условие было инвертировано, и галочка снималась сразу после клика).
+        let mut list = vec![TraySource::KeyRemaining];
+        assert!(tray_click_allowed(list.len(), true));
+        toggle_tray_source(&mut list, TraySource::SpentDay, true);
+        assert_eq!(list, vec![TraySource::KeyRemaining, TraySource::SpentDay]);
+        // Третьего уже не добавить.
+        assert!(!tray_click_allowed(list.len(), true));
     }
 
     #[test]
