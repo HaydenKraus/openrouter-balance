@@ -53,16 +53,18 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() {
-    install_panic_hook();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let minimized_flag = args.iter().any(|a| a == "--minimized");
     let demo = args.iter().find_map(|a| {
         a.strip_prefix("--demo")
             .map(|r| r.trim_start_matches('=').to_string())
     });
+    let demo_mode = demo.is_some();
+    if !demo_mode {
+        install_panic_hook();
+    }
 
-    let Some(guard) = InstanceGuard::acquire() else {
+    let Some(guard) = InstanceGuard::acquire(demo_mode) else {
         return; // уже запущен: первому экземпляру отправлен сигнал «показать окно»
     };
 
@@ -84,19 +86,13 @@ fn main() {
     let signed_in = core.init_keys();
     core.start();
 
-    // Скрытый старт — только если уже есть вход (иначе пользователю нужно окно).
     let start_hidden = signed_in && (minimized_flag || config.start_minimized);
-
-    if start_hidden {
-        core.set_start_hidden();
-    }
     let (tx, rx) = mpsc::channel::<ShellEvent>();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(ui::WINDOW_TITLE)
         .with_inner_size([470.0, 640.0])
-        .with_min_inner_size([400.0, 460.0])
-        .with_visible(!start_hidden);
+        .with_min_inner_size([400.0, 460.0]);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }
@@ -123,10 +119,12 @@ fn main() {
                     hwnd,
                     tx.clone(),
                     Box::new(move || ctx2.request_repaint()),
-                    taskbar::is_autostart(),
+                    (!demo_mode).then(taskbar::is_autostart),
                 )
                 .ok()
             });
+            // Скрываем окно только когда его можно вернуть через трей.
+            let start_hidden = start_hidden && shell.is_some();
             core.attach(ctx, shell.map(Arc::new));
 
             // Обработка событий трея в отдельном потоке: окно может быть скрыто,
@@ -140,6 +138,7 @@ fn main() {
                             ShellEvent::Refresh => core_ev.refresh_now(),
                             ShellEvent::OpenSettings => core_ev.request_open_settings(),
                             ShellEvent::AutostartToggled(on) => core_ev.autostart_toggled(on),
+                            ShellEvent::ToggleWindow => core_ev.toggle_window(),
                             ShellEvent::Quit => core_ev.quit(),
                         }
                     }
@@ -151,7 +150,7 @@ fn main() {
             // guard должен жить до конца процесса.
             std::mem::forget(guard);
 
-            Ok(Box::new(ui::App::new(cc, core)))
+            Ok(Box::new(ui::App::new(cc, core, start_hidden)))
         }),
     );
     // Нормальный выход (или ошибка создания окна): убрать иконку трея и завершить процесс.

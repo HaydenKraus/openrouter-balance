@@ -1,6 +1,7 @@
 //! Интеграция с панелью задач Windows: трей, ITaskbarList3 (прогресс/оверлей),
 //! заголовок окна, автозапуск, единственный экземпляр.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconEvent};
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS,
     HANDLE, HWND, LPARAM, LRESULT, SIZE, WAIT_OBJECT_0, WPARAM,
@@ -41,10 +42,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
-    DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible, PostMessageW,
-    RegisterClassW, SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, GWLP_USERDATA, HICON, HWND_MESSAGE, ICONINFO, MSG, SMTO_ABORTIFHUNG, SW_HIDE,
-    SW_RESTORE, SW_SHOW, WM_APP, WM_SETTEXT, WNDCLASSW,
+    DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsIconic, IsWindowVisible, KillTimer,
+    PostMessageW, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, GWLP_USERDATA, HICON, HWND_MESSAGE, ICONINFO,
+    MSG, SMTO_ABORTIFHUNG, SW_RESTORE, SW_SHOW, WM_APP, WM_SETTEXT, WM_TIMER, WNDCLASSW,
 };
 
 use crate::format::{Level, ProgressKind, TaskbarModel};
@@ -57,11 +58,15 @@ pub enum ShellEvent {
     OpenSettings,
     /// Пункт «Автозапуск» переключён; новое значение.
     AutostartToggled(bool),
+    /// Клик по иконке трея: показать или скрыть окно.
+    ToggleWindow,
     Quit,
 }
 
 /// Сообщение «в очереди есть команда» (в тот же поток, тому же скрытому окну).
 const WM_APP_COMMAND: u32 = WM_APP + 1;
+const REAPPLY_TIMER: usize = 1;
+const REAPPLY_DELAY_MS: u32 = 300;
 /// Запасной размер иконки трея, если DPI узнать не удалось (оверлей панели задач — 16).
 const TRAY_ICON_SIZE: u32 = 32;
 const OVERLAY_ICON_SIZE: u32 = 16;
@@ -91,6 +96,8 @@ const SHUTDOWN_WAIT: Duration = Duration::from_millis(1000);
 const HIDDEN_CLASS: PCWSTR = w!("OpenRouterBalance.MessageWindow");
 const INSTANCE_MUTEX: &str = "Local\\OpenRouterBalance.Instance";
 const INSTANCE_EVENT: &str = "Local\\OpenRouterBalance.Show";
+const DEMO_INSTANCE_MUTEX: &str = "Local\\OpenRouterBalance.Demo.Instance";
+const DEMO_INSTANCE_EVENT: &str = "Local\\OpenRouterBalance.Demo.Show";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "OpenRouterBalance";
 
@@ -121,11 +128,6 @@ fn hwnd_num(hwnd: HWND) -> isize {
 
 fn hwnd_num_from(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
-}
-
-/// `AddRef` и «сырой» указатель интерфейса как число (для передачи в поток).
-fn add_ref_raw(taskbar: &ITaskbarList3) -> *mut c_void {
-    taskbar.to_owned().into_raw()
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,7 +1043,10 @@ fn hicon_from_rgba(rgba: &[u8], size: u32) -> Option<HICON> {
 enum Command {
     Update(TaskbarModel),
     SetAutostartChecked(bool),
+    MenuClick(MenuId),
+    ToggleWindow,
     ShowWindow,
+    ReapplyTaskbar,
     Shutdown,
 }
 
@@ -1064,11 +1069,15 @@ impl CommandQueue {
         self.hwnd.store(hwnd, Ordering::SeqCst);
     }
 
-    fn push(&self, cmd: Command) {
+    fn enqueue(&self, cmd: Command) {
         // ИНВАРИАНТ: блокировка только на время вставки, панику не несёт.
         if let Ok(mut q) = self.queue.lock() {
             q.push_back(cmd);
         }
+    }
+
+    fn push(&self, cmd: Command) {
+        self.enqueue(cmd);
         let hwnd = self.hwnd.load(Ordering::SeqCst);
         if hwnd == 0 {
             return; // поток ещё не создал скрытое окно
@@ -1083,20 +1092,22 @@ impl CommandQueue {
         }
     }
 
-    fn drain(&self) -> Vec<Command> {
-        match self.queue.lock() {
-            Ok(mut q) => q.drain(..).collect(),
-            Err(_) => Vec::new(),
-        }
+    fn pop(&self) -> Option<Command> {
+        self.queue.lock().ok()?.pop_front()
     }
 }
 
-/// Общее состояние трей-потока (нужно и wndproc, и обработчикам трея/меню).
-struct TrayState {
+struct TrayWindow {
     queue: Arc<CommandQueue>,
+    state: RefCell<TrayState>,
+}
+
+/// Состояние принадлежит потоку трея и изменяется при обработке команд.
+struct TrayState {
     events: Sender<ShellEvent>,
     on_event: Box<dyn Fn() + Send + Sync>,
     hwnd: HWND,
+    message_hwnd: HWND,
     tray: Option<TrayIcon>,
     menu: Menu,
     refresh: MenuItem,
@@ -1109,8 +1120,6 @@ struct TrayState {
     last_icon: Option<(u32, Vec<String>)>,
     /// Последняя установленная HICON оверлея (уничтожается при замене).
     overlay_icon: Option<HICON>,
-    /// Поток, который повторно применит прогресс через ~300 мс после показа окна.
-    reapply: Option<JoinHandle<()>>,
 }
 
 impl TrayState {
@@ -1119,24 +1128,26 @@ impl TrayState {
         (self.on_event)();
     }
 
-    fn toggle_window(&self) {
-        let hwnd = self.hwnd;
-        unsafe {
-            let visible = IsWindowVisible(hwnd).as_bool();
-            let iconic = IsIconic(hwnd).as_bool();
-            if visible && !iconic {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            } else {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                if iconic {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(hwnd);
-            }
+    fn handle_menu_click(&self, id: &MenuId) {
+        if id == self.refresh.id() {
+            self.emit(ShellEvent::Refresh);
+        } else if id == self.settings.id() {
+            self.emit(ShellEvent::OpenSettings);
+        } else if id == self.autostart.id() && self.autostart.is_enabled() {
+            // Muda уже переключила галочку; текущее состояние берём из реестра.
+            let want = !is_autostart();
+            let actual = match set_autostart(want) {
+                Ok(()) => want,
+                Err(_) => is_autostart(),
+            };
+            self.autostart.set_checked(actual);
+            self.emit(ShellEvent::AutostartToggled(actual));
+        } else if id == self.quit.id() {
+            self.emit(ShellEvent::Quit);
         }
     }
 
-    fn show_window(&mut self) {
+    fn show_window(&self) {
         let hwnd = self.hwnd;
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -1145,37 +1156,18 @@ impl TrayState {
             }
             let _ = SetForegroundWindow(hwnd);
         }
-        // Кнопка панели задач пересоздаётся после показа — применяем модель повторно.
-        self.apply_taskbar();
-        if self.reapply.is_none() {
-            self.spawn_reapply();
-        }
-    }
-
-    /// Через ~300 мс применить прогресс/оверлей ещё раз (окно могло появиться позже).
-    /// В поток передаются только числа (`HWND`) и клон модели; COM-указатель
-    /// клонируется через `AddRef` и освобождается в конце потока.
-    fn spawn_reapply(&mut self) {
-        let hwnd = hwnd_num(self.hwnd);
-        let taskbar = self.taskbar.as_ref().map(|t| add_ref_raw(t) as usize);
-        let last = self.last_model.clone();
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(300));
-            let taskbar = taskbar.map(|raw| {
-                // ИНВАРИАНТ: AddRef сделан в трей-потоке; Release — ниже, тем же числом ссылок.
-                unsafe { ITaskbarList3::from_raw(raw as *mut c_void) }
-            });
-            apply_taskbar_parts(taskbar.as_ref(), hwnd_num_from(hwnd), last.as_ref());
-            if let Some(t) = taskbar {
-                t.into_raw();
+        if self.taskbar.is_some() {
+            self.apply_taskbar();
+            // Кнопка панели задач может появиться чуть позже окна. Таймер
+            // применит актуальную модель в потоке, которому принадлежит COM.
+            unsafe {
+                SetTimer(
+                    Some(self.message_hwnd),
+                    REAPPLY_TIMER,
+                    REAPPLY_DELAY_MS,
+                    None,
+                );
             }
-        });
-        self.reapply = Some(handle);
-    }
-
-    fn join_reapply(&mut self) {
-        if let Some(h) = self.reapply.take() {
-            let _ = h.join();
         }
     }
 
@@ -1330,10 +1322,6 @@ fn overlay_description(model: &TaskbarModel) -> String {
     }
 }
 
-fn menu_event_id(id: &MenuId) -> u32 {
-    id.0.parse::<u32>().unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Поток трея
 // ---------------------------------------------------------------------------
@@ -1344,39 +1332,63 @@ unsafe extern "system" fn hidden_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_APP_COMMAND {
-        // ИНВАРИАНТ: состояние потока живёт до DestroyWindow (см. run_tray_thread).
-        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-        if ptr != 0 {
-            let state = unsafe { &mut *(ptr as *mut TrayState) };
-            for cmd in state.queue.drain() {
-                handle_command(state, cmd);
+    let reapply = msg == WM_TIMER && wparam.0 == REAPPLY_TIMER;
+    if msg != WM_APP_COMMAND && !reapply {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    if reapply {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), REAPPLY_TIMER);
+        }
+    }
+
+    // Указатель живёт в потоке трея до очистки GWLP_USERDATA.
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const TrayWindow;
+    if let Some(window) = unsafe { ptr.as_ref() } {
+        if reapply {
+            window.queue.enqueue(Command::ReapplyTaskbar);
+        }
+        // COM и Win32 могут вложенно доставить сообщения. Пока внешний вызов
+        // держит состояние, команды остаются в очереди и обрабатываются им же.
+        if let Ok(mut state) = window.state.try_borrow_mut() {
+            while let Some(cmd) = window.queue.pop() {
+                handle_command(&mut state, cmd);
             }
         }
-        return LRESULT(0);
     }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    LRESULT(0)
 }
 
 fn handle_command(state: &mut TrayState, cmd: Command) {
     match cmd {
         Command::Update(model) => state.apply_model(model),
-        Command::SetAutostartChecked(on) => state.autostart.set_checked(on),
+        Command::SetAutostartChecked(on) => {
+            if state.autostart.is_enabled() {
+                state.autostart.set_checked(on);
+            }
+        }
+        Command::MenuClick(id) => state.handle_menu_click(&id),
+        Command::ToggleWindow => state.emit(ShellEvent::ToggleWindow),
         Command::ShowWindow => state.show_window(),
+        Command::ReapplyTaskbar => state.apply_taskbar(),
         Command::Shutdown => {
-            // Флаг выставляет shutdown() до отправки команды; здесь достаточно
-            // закрыть окно, что завершит цикл сообщений.
+            // Флаг завершения уже выставлен; команда будит цикл сообщений.
         }
     }
 }
 
 fn build_menu(
-    autostart_checked: bool,
+    autostart_checked: Option<bool>,
 ) -> Option<(Menu, MenuItem, MenuItem, CheckMenuItem, MenuItem)> {
     let menu = Menu::new();
     let refresh = MenuItem::new("Обновить", true, None);
     let settings = MenuItem::new("Настройки", true, None);
-    let autostart = CheckMenuItem::new("Автозапуск", true, autostart_checked, None);
+    let autostart = CheckMenuItem::new(
+        "Автозапуск",
+        autostart_checked.is_some(),
+        autostart_checked.unwrap_or_default(),
+        None,
+    );
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::new("Выход", true, None);
     menu.append_items(&[&refresh, &settings, &autostart, &sep, &quit])
@@ -1417,14 +1429,15 @@ fn run_tray_thread(
     queue: Arc<CommandQueue>,
     events: Sender<ShellEvent>,
     on_event: Box<dyn Fn() + Send + Sync>,
-    autostart_checked: bool,
+    autostart_checked: Option<bool>,
     main_hwnd: isize,
     ready: Sender<Result<(), String>>,
     shutting_down: Arc<AtomicBool>,
 ) {
     // ИНВАРИАНТ: CoInitializeEx/CoUninitialize парны в этом потоке (STA для Shell API).
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    if let Err(e) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
+        let _ = ready.send(Err(format!("не удалось инициализировать COM: {e}")));
+        return;
     }
 
     let hwnd = match create_hidden_window() {
@@ -1454,10 +1467,10 @@ fn run_tray_thread(
 
     let main = hwnd_of(main_hwnd).unwrap_or(hwnd);
     let mut state = TrayState {
-        queue,
         events,
         on_event,
         hwnd: main,
+        message_hwnd: hwnd,
         tray: None,
         menu,
         refresh,
@@ -1468,13 +1481,7 @@ fn run_tray_thread(
         last_model: None,
         last_icon: None,
         overlay_icon: None,
-        reapply: None,
     };
-
-    // ИНВАРИАНТ: указатель на state валиден до DestroyWindow ниже (state живёт до конца функции).
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut TrayState as isize);
-    }
 
     // Иконка трея создаётся в этом потоке (иначе трей не работает без цикла сообщений).
     let initial_size = tray_icon_size();
@@ -1498,6 +1505,7 @@ fn run_tray_thread(
         }
         Err(e) => {
             let _ = ready.send(Err(format!("не удалось создать иконку трея: {e}")));
+            state.taskbar = None;
             unsafe {
                 let _ = DestroyWindow(hwnd);
                 CoUninitialize();
@@ -1506,55 +1514,25 @@ fn run_tray_thread(
         }
     }
 
-    let ids = (
-        menu_event_id(state.refresh.id()),
-        menu_event_id(state.settings.id()),
-        menu_event_id(state.autostart.id()),
-        menu_event_id(state.quit.id()),
-    );
+    let window = TrayWindow {
+        queue,
+        state: RefCell::new(state),
+    };
+    // `window` остаётся на месте, пока его адрес доступен из оконной процедуры.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &window as *const TrayWindow as isize);
+    }
 
-    // Обработчики вызываются в этом же потоке (из wndproc трея/меню).
-    // В замыкание передаём HWND числом: указатели `*mut c_void` не `Send`.
-    let menu_hwnd = hwnd_num(hwnd);
+    let menu_queue = Arc::downgrade(&window.queue);
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        let id = menu_event_id(event.id());
-        let ptr = unsafe { GetWindowLongPtrW(hwnd_num_from(menu_hwnd), GWLP_USERDATA) };
-        if ptr == 0 {
-            return;
-        }
-        let state = unsafe { &mut *(ptr as *mut TrayState) };
-        if id == ids.0 {
-            state.emit(ShellEvent::Refresh);
-        } else if id == ids.1 {
-            state.show_window();
-            state.emit(ShellEvent::OpenSettings);
-        } else if id == ids.2 {
-            let want = !state.autostart.is_checked();
-            match set_autostart(want) {
-                Ok(()) => {
-                    state.autostart.set_checked(want);
-                    state.emit(ShellEvent::AutostartToggled(want));
-                }
-                Err(_) => {
-                    // Откатываем галочку к фактическому состоянию.
-                    let actual = is_autostart();
-                    state.autostart.set_checked(actual);
-                    state.emit(ShellEvent::AutostartToggled(actual));
-                }
-            }
-        } else if id == ids.3 {
-            state.emit(ShellEvent::Quit);
+        if let Some(queue) = menu_queue.upgrade() {
+            queue.push(Command::MenuClick(event.id().clone()));
         }
     }));
 
-    let tray_hwnd = hwnd_num(hwnd);
+    let tray_queue = Arc::downgrade(&window.queue);
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        let ptr = unsafe { GetWindowLongPtrW(hwnd_num_from(tray_hwnd), GWLP_USERDATA) };
-        if ptr == 0 {
-            return;
-        }
-        let state = unsafe { &mut *(ptr as *mut TrayState) };
-        match event {
+        let cmd = match event {
             TrayIconEvent::Click {
                 button,
                 button_state,
@@ -1562,12 +1540,13 @@ fn run_tray_thread(
             } if button == tray_icon::MouseButton::Left
                 && button_state == tray_icon::MouseButtonState::Up =>
             {
-                state.toggle_window();
+                Command::ToggleWindow
             }
-            TrayIconEvent::DoubleClick { .. } => {
-                state.show_window();
-            }
-            _ => {}
+            TrayIconEvent::DoubleClick { .. } => Command::ShowWindow,
+            _ => return,
+        };
+        if let Some(queue) = tray_queue.upgrade() {
+            queue.push(cmd);
         }
     }));
 
@@ -1580,7 +1559,7 @@ fn run_tray_thread(
             break;
         }
         let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if !ret.as_bool() {
+        if ret.0 <= 0 {
             break; // WM_QUIT (ret == 0) либо ошибка (ret == -1)
         }
         unsafe {
@@ -1589,9 +1568,13 @@ fn run_tray_thread(
         }
     }
 
-    // Подчистка: снять прогресс/оверлей, убрать иконку трея, уничтожить хэндлы.
-    state.join_reapply();
-    if let Some(taskbar) = state.taskbar.clone() {
+    // Отсоединяем состояние до вызовов COM и Win32, которые могут доставить сообщения.
+    window.queue.set_hwnd(0);
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+    let mut state = window.state.into_inner();
+    if let Some(taskbar) = state.taskbar.take() {
         unsafe {
             let _ = taskbar.SetProgressState(state.hwnd, TBPF_NOPROGRESS);
             let _ = taskbar.SetOverlayIcon(state.hwnd, HICON::default(), PCWSTR::null());
@@ -1606,7 +1589,6 @@ fn run_tray_thread(
     state.tray = None;
 
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let _ = DestroyWindow(hwnd);
         CoUninitialize();
     }
@@ -1634,17 +1616,20 @@ struct Shared {
 /// все методы неблокирующие.
 pub struct Shell {
     shared: Arc<Shared>,
+    /// Главное окно приложения (нужно, чтобы спросить у Windows текущую видимость).
+    hwnd: isize,
 }
 
 impl Shell {
     /// Запускает поток: иконка трея + меню, ITaskbarList3 для `hwnd` главного окна.
     /// `events` — канал для `ShellEvent`; `on_event` вызывается после отправки
-    /// (например, чтобы разбудить UI: `ctx.request_repaint()`).
+    /// (например, чтобы разбудить UI: `ctx.request_repaint()`). В демо передаётся
+    /// `None` вместо состояния автозапуска, чтобы заблокировать этот пункт меню.
     pub fn spawn(
         hwnd: isize,
         events: Sender<ShellEvent>,
         on_event: Box<dyn Fn() + Send + Sync>,
-        autostart_checked: bool,
+        autostart_checked: Option<bool>,
     ) -> Result<Shell, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -1678,13 +1663,13 @@ impl Shell {
         });
 
         match ready_rx.recv_timeout(SHUTDOWN_WAIT) {
-            Ok(Ok(())) => Ok(Shell { shared }),
+            Ok(Ok(())) => Ok(Shell { shared, hwnd }),
             Ok(Err(e)) => {
-                Shell { shared }.stop_thread();
+                Shell { shared, hwnd }.stop_thread();
                 Err(e)
             }
             Err(_) => {
-                Shell { shared }.stop_thread();
+                Shell { shared, hwnd }.stop_thread();
                 Err("поток трея не ответил за 1 с".to_string())
             }
         }
@@ -1698,6 +1683,12 @@ impl Shell {
     /// Синхронизировать галочку «Автозапуск» в меню.
     pub fn set_autostart_checked(&self, on: bool) {
         self.send(Command::SetAutostartChecked(on));
+    }
+
+    /// Видно ли окно прямо сейчас (не скрыто и не свёрнуто).
+    pub fn is_window_shown(&self) -> bool {
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
     }
 
     /// Показать окно (restore + foreground); применяет последний прогресс/оверлей заново.
@@ -1984,8 +1975,12 @@ impl InstanceGuard {
 
     /// `Some(guard)` — мы первые. `None` — экземпляр уже запущен; ему отправлен
     /// сигнал «показать окно» (именованное событие), текущий процесс должен завершиться.
-    pub fn acquire() -> Option<InstanceGuard> {
-        Self::acquire_named(INSTANCE_MUTEX, INSTANCE_EVENT)
+    pub fn acquire(demo: bool) -> Option<InstanceGuard> {
+        if demo {
+            Self::acquire_named(DEMO_INSTANCE_MUTEX, DEMO_INSTANCE_EVENT)
+        } else {
+            Self::acquire_named(INSTANCE_MUTEX, INSTANCE_EVENT)
+        }
     }
 
     /// Запускает поток, который при сигнале от повторного запуска вызывает `on_activate`.
@@ -2538,8 +2533,8 @@ mod tests {
         use windows::core::w;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-            RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_DESTROY,
-            WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_HIDE, SW_SHOW,
+            WM_DESTROY, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         };
         use GetModuleHandleW;
 
@@ -2583,7 +2578,7 @@ mod tests {
             };
             let _ = ShowWindow(hwnd, SW_SHOW);
             let (tx, rx) = std::sync::mpsc::channel();
-            let shell = match Shell::spawn(hwnd.0 as isize, tx, Box::new(|| {}), false) {
+            let shell = match Shell::spawn(hwnd.0 as isize, tx, Box::new(|| {}), Some(false)) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = DestroyWindow(hwnd);
@@ -2627,14 +2622,20 @@ mod tests {
             });
             pump(120);
         }
-        shell.show_window();
-        pump(400);
+        for _ in 0..2 {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            shell.show_window();
+            pump(u64::from(REAPPLY_DELAY_MS) + 100);
+            assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
+        }
         shell.set_autostart_checked(true);
         pump(120);
         shell.shutdown();
         shell.shutdown();
         drop(shell);
-        assert!(rx.try_recv().is_err() || true);
+        assert!(rx.try_recv().is_err());
         unsafe {
             let _ = DestroyWindow(hwnd);
         }

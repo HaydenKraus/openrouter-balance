@@ -61,25 +61,58 @@ pub fn level_for_fraction(remaining_fraction: Option<f64>) -> Level {
     }
 }
 
-/// Доля остатка лимита ключа (0..1, может быть <0 → 0). `None` если лимита нет
-/// или он не положителен. При отсутствии лимита ключа берётся `effective_budget`;
-/// если есть оба — меньшая доля.
-pub fn remaining_fraction(key: &KeyInfo) -> Option<f64> {
-    let own = match (key.limit, key.limit_remaining) {
-        (Some(limit), Some(rem)) if limit > 0.0 => Some(rem / limit),
-        (Some(limit), None) if limit > 0.0 => Some((limit - key.usage) / limit),
-        _ => None,
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitSource {
+    Key,
+    Budget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RemainingLimit {
+    pub source: LimitSource,
+    pub limit: f64,
+    pub remaining: f64,
+    pub fraction: f64,
+}
+
+impl RemainingLimit {
+    fn new(source: LimitSource, limit: f64, remaining: f64) -> Option<Self> {
+        if !limit.is_finite() || limit < 0.0 || !remaining.is_finite() {
+            return None;
+        }
+        Some(Self {
+            source,
+            limit,
+            remaining,
+            fraction: if limit == 0.0 {
+                0.0
+            } else {
+                (remaining / limit).clamp(0.0, 1.0)
+            },
+        })
+    }
+}
+
+/// Лимит с наименьшей долей остатка. Сумма и доля относятся к одному ограничению.
+pub fn effective_remaining(key: &KeyInfo) -> Option<RemainingLimit> {
+    let own = key_limit(key);
     let budget = key.effective_budget.as_ref().and_then(|b| {
         let limit = b.limit_usd?;
-        let rem = b.remaining_usd?;
-        (limit > 0.0).then_some(rem / limit)
+        let remaining = b
+            .remaining_usd
+            .or_else(|| b.spend_usd.map(|spent| limit - spent));
+        let remaining = remaining.or_else(|| (limit == 0.0).then_some(0.0))?;
+        RemainingLimit::new(LimitSource::Budget, limit, remaining)
     });
-    let f = match (own, budget) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }?;
-    Some(f.clamp(0.0, 1.0))
+    match (own, budget) {
+        (Some(key), Some(budget)) if key.fraction <= budget.fraction => Some(key),
+        (_, Some(budget)) => Some(budget),
+        (key, None) => key,
+    }
+}
+
+pub fn key_limit(key: &KeyInfo) -> Option<RemainingLimit> {
+    RemainingLimit::new(LimitSource::Key, key.limit?, key_remaining(key)?)
 }
 
 /// Остаток лимита ключа в USD (используем `limit_remaining`, иначе limit − usage).
@@ -181,7 +214,8 @@ pub fn source_value(snap: &Snapshot, source: TraySource) -> Option<f64> {
 /// Автоматический выбор, если ничего из выбранного недоступно:
 /// остаток лимита → баланс аккаунта → потрачено.
 fn fallback_value(snap: &Snapshot) -> Option<f64> {
-    source_value(snap, TraySource::KeyRemaining)
+    effective_remaining(&snap.key)
+        .map(|limit| limit.remaining)
         .or_else(|| source_value(snap, TraySource::AccountBalance))
         .or_else(|| source_value(snap, TraySource::Spent))
 }
@@ -318,21 +352,24 @@ impl TaskbarModel {
         };
 
         let key = &snap.key;
-        let frac = remaining_fraction(key);
+        let effective = effective_remaining(key);
+        let frac = effective.map(|limit| limit.fraction);
         let data_level = level_for_fraction(frac);
         let stale = st.is_stale();
         let level = if stale { Level::Error } else { data_level };
 
-        let rem = key_remaining(key);
-        // Нет лимита у ключа — показываем остаток баланса аккаунта, если он известен.
+        // Нет ограничения — показываем остаток баланса аккаунта, если он известен.
         let account = match snap.credits {
             CreditsStatus::Available(c) => Some(c.remaining()),
             _ => None,
         };
         let (tray_text, overlay_warning) = if stale {
             ("!".to_string(), true)
-        } else if let Some(r) = rem {
-            (short_money(r), matches!(data_level, Level::Red))
+        } else if let Some(limit) = effective {
+            (
+                short_money(limit.remaining),
+                matches!(data_level, Level::Red),
+            )
         } else if let Some(a) = account {
             (short_money(a), false)
         } else {
@@ -355,9 +392,19 @@ impl TaskbarModel {
             None => (ProgressKind::None, 0.0),
         };
 
-        let main = match (key.limit, rem) {
-            (Some(l), Some(r)) => format!("остаток {} / {}", money(r), money(l)),
-            _ => match account {
+        let main = match effective {
+            Some(limit) => {
+                let label = match limit.source {
+                    LimitSource::Key => "остаток",
+                    LimitSource::Budget => "остаток бюджета",
+                };
+                format!(
+                    "{label} {} / {}",
+                    money(limit.remaining),
+                    money(limit.limit)
+                )
+            }
+            None => match account {
                 Some(a) => format!("баланс {}", money(a)),
                 None => format!("потрачено {}", money(key.usage)),
             },
@@ -374,7 +421,7 @@ impl TaskbarModel {
             tray_lines: vec![tray_text.clone()],
             overlay_text: tray_text,
             overlay_warning,
-            tooltip: truncate_chars(&tooltip_text(snap, st), TRAY_TIP_MAX),
+            tooltip: truncate_chars(&tooltip_text(snap, st, effective), TRAY_TIP_MAX),
             title,
             progress,
             progress_spent,
@@ -383,13 +430,20 @@ impl TaskbarModel {
 }
 
 /// Полная сводка для тултипа (потом обрезается до 127 символов).
-pub fn tooltip_text(snap: &Snapshot, st: &AppState) -> String {
+fn tooltip_text(snap: &Snapshot, st: &AppState, effective: Option<RemainingLimit>) -> String {
     let key = &snap.key;
     let mut lines: Vec<String> = Vec::new();
     if st.is_stale() {
         lines.push("⚠ Данные устарели".to_string());
     }
     lines.push(format!("Потрачено: {}", money(key.usage)));
+    if let Some(limit) = effective.filter(|limit| limit.source == LimitSource::Budget) {
+        lines.push(format!(
+            "Остаток бюджета: {} из {}",
+            money(limit.remaining),
+            money(limit.limit)
+        ));
+    }
     match (key.limit, key_remaining(key)) {
         (Some(l), Some(r)) => lines.push(format!("Остаток: {} из {}", money(r), money(l))),
         _ => lines.push("Лимит: без лимита".to_string()),
@@ -489,19 +543,16 @@ mod tests {
 
     #[test]
     fn fraction_edge_cases() {
-        assert_eq!(remaining_fraction(&key(None, None, 5.0)), None);
-        assert_eq!(remaining_fraction(&key(Some(0.0), Some(0.0), 0.0)), None);
-        assert_eq!(
-            remaining_fraction(&key(Some(50.0), Some(12.5), 37.5)),
-            Some(0.25)
-        );
+        let fraction = |key| effective_remaining(&key).map(|limit| limit.fraction);
+        assert_eq!(fraction(key(None, None, 5.0)), None);
+        assert_eq!(fraction(key(Some(0.0), Some(0.0), 0.0)), Some(0.0));
+        assert_eq!(fraction(key(Some(-5.0), None, 5.0)), None);
+        assert_eq!(fraction(key(Some(f64::NAN), None, 5.0)), None);
+        assert_eq!(fraction(key(Some(50.0), Some(12.5), 37.5)), Some(0.25));
         // отрицательный остаток → 0
-        assert_eq!(
-            remaining_fraction(&key(Some(10.0), Some(-2.0), 12.0)),
-            Some(0.0)
-        );
+        assert_eq!(fraction(key(Some(10.0), Some(-2.0), 12.0)), Some(0.0));
         // limit_remaining отсутствует → limit − usage
-        assert_eq!(remaining_fraction(&key(Some(10.0), None, 7.5)), Some(0.25));
+        assert_eq!(fraction(key(Some(10.0), None, 7.5)), Some(0.25));
     }
 
     #[test]
@@ -512,14 +563,37 @@ mod tests {
             remaining_usd: Some(1.0),
             ..Default::default()
         });
-        assert_eq!(remaining_fraction(&k), Some(0.1));
+        assert_eq!(
+            effective_remaining(&k),
+            Some(RemainingLimit {
+                source: LimitSource::Budget,
+                limit: 10.0,
+                remaining: 1.0,
+                fraction: 0.1,
+            })
+        );
+        let model = TaskbarModel::from_state(&state_with(k, None));
+        assert_eq!(model.overlay_text, "$1.0");
+        assert_eq!(model.progress_spent, 0.9);
+        assert_eq!(model.title, "OpenRouter — остаток бюджета $1.00 / $10.00");
+        assert!(model.tooltip.contains("Остаток бюджета: $1.00 из $10.00"));
+
         let mut k2 = key(None, None, 3.0);
         k2.effective_budget = Some(KeyBudget {
             limit_usd: Some(10.0),
-            remaining_usd: Some(5.0),
+            spend_usd: Some(5.0),
             ..Default::default()
         });
-        assert_eq!(remaining_fraction(&k2), Some(0.5));
+        let limit = effective_remaining(&k2).unwrap();
+        assert_eq!((limit.remaining, limit.fraction), (5.0, 0.5));
+    }
+
+    #[test]
+    fn model_zero_limit_is_exhausted() {
+        let model = TaskbarModel::from_state(&state_with(key(Some(0.0), Some(0.0), 0.0), None));
+        assert_eq!(model.level, Level::Red);
+        assert_eq!(model.progress_spent, 1.0);
+        assert_eq!(model.overlay_text, "$0");
     }
 
     #[test]

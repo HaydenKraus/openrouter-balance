@@ -1,7 +1,6 @@
 //! Запросы к OpenRouter и модели ответов.
 //!
-//! Модели ответов толерантны к отсутствию полей (`#[serde(default)]`), чтобы
-//! изменение схемы на стороне OpenRouter не ломало приложение.
+//! Необязательные поля допускают отсутствие (`#[serde(default)]`).
 
 use std::time::{Duration, SystemTime};
 
@@ -44,7 +43,6 @@ pub struct KeyInfo {
     pub limit_remaining: Option<f64>,
     #[serde(default)]
     pub limit_reset: Option<String>,
-    #[serde(default)]
     pub usage: f64,
     #[serde(default)]
     pub usage_daily: f64,
@@ -83,7 +81,7 @@ struct CreditsEnvelope {
     data: Credits,
 }
 
-/// Разбор тела ответа `/key`. Пустое тело или отсутствие `data` — ошибка.
+/// Разбор тела ответа `/key`. Поля `data` и `usage` обязательны.
 pub fn parse_key(body: &str) -> Result<KeyInfo, ApiError> {
     serde_json::from_str::<KeyEnvelope>(body)
         .map(|e| e.data)
@@ -107,7 +105,7 @@ pub enum ApiError {
     Unauthorized,
     /// 403.
     Forbidden,
-    /// 429 (после исчерпания повторов).
+    /// 429 (исчерпаны повторы или сервер просит подождать дольше).
     RateLimited {
         retry_after: Option<Duration>,
     },
@@ -136,14 +134,24 @@ impl std::error::Error for ApiError {}
 /// Результат попытки получить общий баланс.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CreditsStatus {
-    /// Management-ключ не задан или `/credits` вернул 403 — это не ошибка.
+    /// Нет подходящего management-ключа или `/credits` вернул 401/403.
     NeedsManagementKey,
     Available(Credits),
     /// Временная ошибка при запросе `/credits` (сеть, 429, 5xx).
     Unavailable,
 }
 
-/// Полный снимок данных одного обновления.
+impl From<Result<Credits, ApiError>> for CreditsStatus {
+    fn from(result: Result<Credits, ApiError>) -> Self {
+        match result {
+            Ok(credits) => Self::Available(credits),
+            Err(ApiError::Forbidden | ApiError::Unauthorized) => Self::NeedsManagementKey,
+            Err(_) => Self::Unavailable,
+        }
+    }
+}
+
+/// Последние данные ключа и независимо обновляемый общий баланс.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub key: KeyInfo,
@@ -155,21 +163,35 @@ pub struct Snapshot {
 // Разбор заголовков и расчёт пауз (чистые функции — тестируются отдельно)
 // ---------------------------------------------------------------------------
 
-/// `Retry-After` в секундах. HTTP-date и отрицательные значения игнорируются.
-pub fn parse_retry_after(header_value: Option<&str>) -> Option<Duration> {
-    let seconds: u64 = header_value?.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds))
+/// `Retry-After` в секундах или в формате HTTP-date (IMF-fixdate).
+fn parse_retry_after(
+    header_value: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
+    let value = header_value?.trim();
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let retry_at = chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()?
+        .and_utc();
+    Some(
+        retry_at
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default(),
+    )
 }
 
 /// Пауза перед повтором `attempt` (нумерация с 1).
 ///
-/// `Retry-After` имеет приоритет, но ограничен [`MAX_RETRY_AFTER`]. Иначе —
+/// `Retry-After` имеет приоритет. Иначе —
 /// экспоненциальный backoff `base * 2^(attempt-1)`, ограниченный
 /// [`MAX_BACKOFF`] и разбавленный джиттером (0–25 %, чтобы повторы разных
-/// экземпляров не совпадали). Потолок `Retry-After` при этом не нарушается.
+/// экземпляров не совпадали).
 pub fn backoff(attempt: u32, retry_after: Option<Duration>, base: Duration) -> Duration {
     match retry_after {
-        Some(server) => server.min(MAX_RETRY_AFTER),
+        Some(server) => server,
         None => {
             let shift = attempt.saturating_sub(1).min(20);
             let exponential = base.saturating_mul(1u32 << shift).min(MAX_BACKOFF);
@@ -179,8 +201,8 @@ pub fn backoff(attempt: u32, retry_after: Option<Duration>, base: Duration) -> D
     }
 }
 
-/// Потолок ожидания из заголовка `Retry-After`.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Более долгую паузу планирует вызывающий код.
+const MAX_INLINE_RETRY_WAIT: Duration = Duration::from_secs(30);
 /// Потолок экспоненциального backoff без заголовка.
 const MAX_BACKOFF: Duration = Duration::from_secs(4);
 /// Число повторов при 429.
@@ -265,38 +287,6 @@ impl Client {
             .await
     }
 
-    /// Полное обновление: `/key` обязателен; `/credits` вызывается всегда —
-    /// с `management_key`, если он задан, иначе с обычным ключом (вдруг он
-    /// сам management). 403 → `NeedsManagementKey`; 401 на `/credits` при
-    /// заданном management-ключе → `NeedsManagementKey` (ключ неверный);
-    /// прочие ошибки `/credits` → `Unavailable` (не валят весь снимок).
-    /// Ошибка `/key` → `Err`.
-    pub async fn fetch_snapshot(
-        &self,
-        key: &str,
-        management_key: Option<&str>,
-    ) -> Result<Snapshot, ApiError> {
-        let credits_key = management_key.unwrap_or(key);
-        // Оба запроса независимы: параллельно, чтобы обновление шло за один RTT.
-        let (key_result, credits_result) =
-            tokio::join!(self.fetch_key(key), self.fetch_credits(credits_key));
-
-        let key = key_result?;
-        let credits = match credits_result {
-            Ok(credits) => CreditsStatus::Available(credits),
-            // 403 — ключ не management; 401 — management-ключ неверен либо
-            // обычный ключ не имеет доступа к /credits. Ни то, ни другое не
-            // является сбоем обновления.
-            Err(ApiError::Forbidden | ApiError::Unauthorized) => CreditsStatus::NeedsManagementKey,
-            Err(_) => CreditsStatus::Unavailable,
-        };
-        Ok(Snapshot {
-            key,
-            credits,
-            fetched_at: SystemTime::now(),
-        })
-    }
-
     /// Один запрос: статус → разбор тела. Без повторов.
     async fn fetch_once<T>(
         &self,
@@ -339,14 +329,15 @@ impl Client {
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
+                    chrono::Utc::now(),
                 ),
             }),
             other => Err(ApiError::Http(other)),
         }
     }
 
-    /// `fetch_once` с повторами при 429. Если 429 держится после всех попыток —
-    /// возвращается последняя ошибка с её `Retry-After`.
+    /// `fetch_once` с повторами при 429. После исчерпания попыток или при долгой
+    /// паузе возвращается последняя ошибка с её `Retry-After`.
     async fn fetch_with_retries<T>(
         &self,
         path: &str,
@@ -362,10 +353,11 @@ impl Client {
                 ApiError::RateLimited { retry_after } => retry_after,
                 other => return Err(other),
             };
-            if attempt == MAX_RETRIES {
+            let delay = backoff(attempt, retry_after, self.base_delay);
+            if attempt == MAX_RETRIES || delay > MAX_INLINE_RETRY_WAIT {
                 return Err(ApiError::RateLimited { retry_after });
             }
-            tokio::time::sleep(backoff(attempt, retry_after, self.base_delay)).await;
+            tokio::time::sleep(delay).await;
         }
         Err(ApiError::RateLimited { retry_after: None })
     }
@@ -569,6 +561,7 @@ mod tests {
         for body in [
             "",
             "{}",
+            r#"{"data":{}}"#,
             r#"{"data":null}"#,
             "not json",
             r#"{"data":{"usage":"x"}}"#,
@@ -614,31 +607,38 @@ mod tests {
 
     #[test]
     fn retry_after_parses_integer_seconds() {
-        assert_eq!(parse_retry_after(Some("0")), Some(Duration::from_secs(0)));
-        assert_eq!(parse_retry_after(Some("5")), Some(Duration::from_secs(5)));
-        assert_eq!(parse_retry_after(Some(" 7 ")), Some(Duration::from_secs(7)));
+        let now = chrono::DateTime::UNIX_EPOCH;
+        for (header, seconds) in [("0", 0), ("5", 5), (" 7 ", 7), ("120", 120)] {
+            assert_eq!(
+                parse_retry_after(Some(header), now),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_http_date() {
+        let now = "2026-10-21T07:27:58Z".parse().unwrap();
         assert_eq!(
-            parse_retry_after(Some("120")),
-            Some(Duration::from_secs(120))
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT"), now),
+            Some(Duration::from_secs(2)),
+        );
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:27:57 GMT"), now),
+            Some(Duration::ZERO),
         );
     }
 
     #[test]
     fn retry_after_ignores_invalid_values() {
-        assert_eq!(parse_retry_after(None), None);
-        assert_eq!(parse_retry_after(Some("")), None);
-        // HTTP-date по спецификации допустим, но здесь игнорируется.
-        assert_eq!(
-            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            None
-        );
-        assert_eq!(parse_retry_after(Some("1.5")), None);
-        assert_eq!(parse_retry_after(Some("-3")), None);
-        assert_eq!(parse_retry_after(Some("abc")), None);
+        let now = chrono::DateTime::UNIX_EPOCH;
+        for header in [None, Some(""), Some("1.5"), Some("-3"), Some("abc")] {
+            assert_eq!(parse_retry_after(header, now), None);
+        }
     }
 
     #[test]
-    fn backoff_prefers_retry_after_capped_at_30s() {
+    fn backoff_prefers_retry_after() {
         let base = Duration::from_secs(1);
         assert_eq!(
             backoff(1, Some(Duration::from_secs(2)), base),
@@ -650,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             backoff(1, Some(Duration::from_secs(600)), base),
-            Duration::from_secs(30)
+            Duration::from_secs(600)
         );
     }
 
@@ -843,10 +843,12 @@ mod tests {
     #[tokio::test]
     async fn fetch_credits_200_parses() {
         let (base, requests) = spawn_server(vec![Reply::new(200, CREDITS_BODY)]).await;
-        let credits = parse(test_client(&base).fetch_credits("k").await);
+        let credits = parse(test_client(&base).fetch_credits("mgmt-key").await);
         assert_eq!(credits.total_credits, 100.0);
         assert!((credits.remaining() - 57.75).abs() < 1e-9);
-        assert!(paths_seen(&requests)[0].starts_with("GET /credits "));
+        let requests = requests.lock().expect("mutex");
+        assert!(requests[0].starts_with("GET /credits "));
+        assert!(requests[0].contains("Bearer mgmt-key"));
     }
 
     #[tokio::test]
@@ -936,6 +938,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_retry_after_defers_to_caller_without_retrying() {
+        let (base, requests) =
+            spawn_server(vec![Reply::new(429, "{}").with_header("Retry-After: 600")]).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            test_client(&base).fetch_credits("k").await
+        })
+        .await
+        .expect("долгую задержку должен планировать вызывающий код");
+        assert_eq!(
+            parse_err(result),
+            ApiError::RateLimited {
+                retry_after: Some(Duration::from_secs(600))
+            }
+        );
+        assert_eq!(paths_seen(&requests).len(), 1);
+    }
+
+    #[tokio::test]
     async fn persistent_429_without_header_keeps_none() {
         let (base, _) = spawn_server(vec![Reply::new(429, "{}")]).await;
         let error = parse_err(test_client(&base).fetch_key("k").await);
@@ -972,140 +992,25 @@ mod tests {
         assert_eq!(paths_seen(&requests).len(), 1);
     }
 
-    // -----------------------------------------------------------------------
-    // fetch_snapshot
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn snapshot_ok_without_management_key_makes_two_requests() {
-        // Без management-ключа /credits идёт с обычным ключом: здесь он его принимает.
-        let (base, requests) = spawn_server(vec![
-            Reply::new(200, KEY_NULL_LIMIT),
-            Reply::new(200, CREDITS_BODY),
-        ])
-        .await;
-        let snapshot = parse(test_client(&base).fetch_snapshot("main-key", None).await);
-
-        match snapshot.credits {
-            CreditsStatus::Available(credits) => assert_eq!(credits.total_credits, 100.0),
-            other => panic!("ожидался Available, получено {other:?}"),
-        }
-        assert_eq!(snapshot.key.label.as_deref(), Some("default"));
-
-        let seen = paths_seen(&requests);
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen.iter().any(|l| l.starts_with("GET /key ")));
-        assert!(seen.iter().any(|l| l.starts_with("GET /credits ")));
-        // fetched_at — момент запроса, а не эпоха.
-        let age = SystemTime::now()
-            .duration_since(snapshot.fetched_at)
-            .unwrap_or_default();
-        assert!(
-            age < Duration::from_secs(60),
-            "fetched_at выглядит неверным: {age:?}"
+    #[test]
+    fn credits_status_classifies_results() {
+        let credits = parse(parse_credits(CREDITS_BODY));
+        assert_eq!(
+            CreditsStatus::from(Ok(credits)),
+            CreditsStatus::Available(credits)
         );
-    }
-
-    #[tokio::test]
-    async fn snapshot_403_on_credits_needs_management_key() {
-        let (base, _) = spawn_server(vec![
-            Reply::new(200, KEY_NULL_LIMIT),
-            Reply::new(403, r#"{"error":{"code":403}}"#),
-        ])
-        .await;
-        let snapshot = parse(test_client(&base).fetch_snapshot("main", None).await);
-        assert_eq!(snapshot.credits, CreditsStatus::NeedsManagementKey);
-    }
-
-    #[tokio::test]
-    async fn snapshot_401_on_credits_with_management_key_needs_management_key() {
-        let (base, _) = spawn_server(vec![
-            Reply::new(200, KEY_NULL_LIMIT),
-            Reply::new(401, r#"{"error":{"code":401}}"#),
-        ])
-        .await;
-        let snapshot = parse(
-            test_client(&base)
-                .fetch_snapshot("main", Some("bad-mgmt"))
-                .await,
-        );
-        assert_eq!(snapshot.credits, CreditsStatus::NeedsManagementKey);
-    }
-
-    #[tokio::test]
-    async fn snapshot_401_on_credits_without_management_key_needs_management_key() {
-        let (base, _) = spawn_server(vec![
-            Reply::new(200, KEY_NULL_LIMIT),
-            Reply::new(401, r#"{"error":{"code":401}}"#),
-        ])
-        .await;
-        let snapshot = parse(test_client(&base).fetch_snapshot("main", None).await);
-        assert_eq!(snapshot.credits, CreditsStatus::NeedsManagementKey);
-    }
-
-    #[tokio::test]
-    async fn snapshot_uses_management_key_for_credits() {
-        let (base, requests) = spawn_server(vec![
-            Reply::new(200, KEY_NULL_LIMIT),
-            Reply::new(200, CREDITS_BODY),
-        ])
-        .await;
-        parse(
-            test_client(&base)
-                .fetch_snapshot("main-key", Some("mgmt-key"))
-                .await,
-        );
-
-        let requests = requests.lock().expect("mutex").clone();
-        let credits = requests
-            .iter()
-            .find(|r| r.contains("GET /credits "))
-            .expect("запрос /credits");
-        assert!(
-            credits.contains("Bearer mgmt-key"),
-            "management-ключ не использован: {credits:?}"
-        );
-        assert!(!credits.contains("main-key"));
-    }
-
-    #[tokio::test]
-    async fn snapshot_credits_failure_does_not_break_it() {
-        // 500 и 429 на /credits дают Unavailable, но снимок остаётся Ok.
-        for status in [500u16, 429] {
-            let (base, _) = spawn_server(vec![
-                Reply::new(200, KEY_NULL_LIMIT),
-                Reply::new(status, "{}"),
-            ])
-            .await;
-            let result = test_client(&base).fetch_snapshot("main", None).await;
-            let snapshot = parse(result);
+        for error in [ApiError::Unauthorized, ApiError::Forbidden] {
             assert_eq!(
-                snapshot.credits,
-                CreditsStatus::Unavailable,
-                "статус {status}"
+                CreditsStatus::from(Err(error)),
+                CreditsStatus::NeedsManagementKey
             );
-            assert_eq!(snapshot.key.label.as_deref(), Some("default"));
         }
-    }
-
-    #[tokio::test]
-    async fn snapshot_key_failure_is_fatal() {
-        // Ошибка /key → Err независимо от /credits.
-        let (base, _) = spawn_server(vec![
-            Reply::new(401, r#"{"error":{"code":401}}"#),
-            Reply::new(200, CREDITS_BODY),
-        ])
-        .await;
-        let error = parse_err(test_client(&base).fetch_snapshot("bad", Some("mgmt")).await);
-        assert_eq!(error, ApiError::Unauthorized);
-
-        // Битое тело /key тоже валит снимок.
-        let (base, _) =
-            spawn_server(vec![Reply::new(200, "{"), Reply::new(200, CREDITS_BODY)]).await;
-        assert!(matches!(
-            parse_err(test_client(&base).fetch_snapshot("k", None).await),
-            ApiError::Parse(_)
-        ));
+        for error in [
+            ApiError::Http(500),
+            ApiError::RateLimited { retry_after: None },
+        ] {
+            assert_eq!(CreditsStatus::from(Err(error)), CreditsStatus::Unavailable);
+        }
     }
 
     #[tokio::test]

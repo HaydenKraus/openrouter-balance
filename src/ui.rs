@@ -1,13 +1,12 @@
 //! egui-интерфейс приложения: экран входа, главный экран с данными, настройки.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use egui::{Color32, RichText};
 
 use crate::api::{CreditsStatus, KeyInfo, Snapshot};
 use crate::config::{Config, TraySource, MAX_REFRESH_SECS, MAX_TRAY_SOURCES, MIN_REFRESH_SECS};
-use crate::format::{self, Level, TaskbarModel};
+use crate::format::{self, Level, LimitSource, RemainingLimit};
 use crate::state::{AppState, AuthPhase, ErrorKind};
 use crate::worker::{Core, MgmtKeyChange};
 
@@ -18,39 +17,17 @@ pub const WINDOW_TITLE: &str = "OpenRouter Баланс";
 // Чистые функции отображения (покрыты тестами)
 // ---------------------------------------------------------------------------
 
-/// Доля потраченного лимита в процентах, 0..=100. `None`, если лимита нет.
-pub fn spent_pct(limit: Option<f64>, usage: f64) -> Option<f64> {
-    match limit {
-        Some(l) if l.is_finite() && l > 0.0 && usage.is_finite() => {
-            Some((usage / l * 100.0).clamp(0.0, 100.0))
-        }
-        _ => None,
-    }
-}
-
-/// Потрачено из лимита в текущем периоде: `limit − limit_remaining`.
-/// Так полоса совпадает с цветом трея, даже если лимит сбрасывается по периоду
-/// (`usage` — расход за всё время). Без `limit_remaining` — `usage`.
-pub fn period_spent(key: &KeyInfo) -> f64 {
-    match (key.limit, key.limit_remaining) {
-        (Some(l), Some(r)) => l - r,
-        _ => key.usage,
-    }
-}
-
-/// Подпись прогресс-бара: «Потрачено $X из $Y (Z%)».
-pub fn spent_caption(limit: Option<f64>, usage: f64) -> String {
-    match (limit, spent_pct(limit, usage)) {
-        (Some(l), Some(p)) => {
-            format!(
-                "Потрачено {} из {} ({:.0}%)",
-                format::money(usage),
-                format::money(l),
-                p
-            )
-        }
-        _ => format!("Потрачено {}", format::money(usage)),
-    }
+fn spent_caption(limit: RemainingLimit) -> String {
+    let label = match limit.source {
+        LimitSource::Key => "Потрачено",
+        LimitSource::Budget => "Потрачено из бюджета",
+    };
+    format!(
+        "{label} {} из {} ({:.0}%)",
+        format::money(limit.limit - limit.remaining),
+        format::money(limit.limit),
+        (1.0 - limit.fraction) * 100.0,
+    )
 }
 
 /// Остаток ключа для карточки: `None` — лимита нет.
@@ -120,10 +97,10 @@ pub fn budget_line(b: &crate::api::KeyBudget) -> String {
     }
 }
 
-/// Метка лимита ключа: `None` или неположительный лимит — «без лимита».
+/// Метка лимита ключа: `None` — «без лимита».
 pub fn limit_text(limit: Option<f64>) -> String {
     match limit {
-        Some(l) if l > 0.0 && l.is_finite() => format::money(l),
+        Some(l) if l >= 0.0 && l.is_finite() => format::money(l),
         _ => "без лимита".to_string(),
     }
 }
@@ -165,22 +142,61 @@ struct SettingsDraft {
     error: Option<String>,
 }
 
+enum SettingsAction {
+    ContinueEditing,
+    Save,
+    Cancel,
+}
+
+impl SettingsDraft {
+    fn finish(
+        mut self,
+        action: SettingsAction,
+        apply: impl FnOnce(Config, MgmtKeyChange) -> Result<(), String>,
+    ) -> Option<Self> {
+        match action {
+            SettingsAction::ContinueEditing => return Some(self),
+            SettingsAction::Cancel => return None,
+            SettingsAction::Save => {}
+        }
+        // Введённый новый ключ важнее нажатого ранее «Удалить».
+        let key = self.mgmt.trim();
+        let change = if !key.is_empty() {
+            MgmtKeyChange::Set(key.to_owned())
+        } else if self.remove_mgmt {
+            MgmtKeyChange::Clear
+        } else {
+            MgmtKeyChange::Keep
+        };
+        self.mgmt.clear();
+        match apply(self.cfg.clone(), change) {
+            Ok(()) => None,
+            Err(error) => {
+                self.error = Some(error);
+                Some(self)
+            }
+        }
+    }
+}
+
 pub struct App {
     core: Arc<Core>,
     login_key: String,
     settings: Option<SettingsDraft>,
+    start_hidden: bool,
     /// Запрошенное скрытие окна (обрабатывается в конце кадра).
     hide_requested: bool,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, core: Arc<Core>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, core: Arc<Core>, start_hidden: bool) -> Self {
         // Тема — системная; размеры egui масштабирует под DPI автоматически.
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
         Self {
             core,
             login_key: String::new(),
             settings: None,
+            start_hidden,
             hide_requested: false,
         }
     }
@@ -279,7 +295,11 @@ impl App {
 
     // -- главный экран ------------------------------------------------------
 
-    fn main_screen(&mut self, ui: &mut egui::Ui, state: &AppState, level: Level) {
+    fn main_screen(&mut self, ui: &mut egui::Ui, state: &AppState) {
+        if let Some(error) = &state.login_error {
+            ui.colored_label(level_color(Level::Red), error.as_str());
+            ui.add_space(4.0);
+        }
         if state.is_stale() {
             ui.colored_label(level_color(Level::Error), "⚠ данные устарели");
             ui.add_space(4.0);
@@ -299,7 +319,7 @@ impl App {
         }
 
         match &state.snapshot {
-            Some(snap) => self.snapshot_view(ui, snap, level),
+            Some(snap) => self.snapshot_view(ui, snap, state.is_stale()),
             None => match &state.error {
                 Some(err) => {
                     ui.add_space(6.0);
@@ -323,10 +343,10 @@ impl App {
         }
     }
 
-    fn snapshot_view(&self, ui: &mut egui::Ui, snap: &Snapshot, level: Level) {
+    fn snapshot_view(&self, ui: &mut egui::Ui, snap: &Snapshot, stale: bool) {
         let key = &snap.key;
 
-        self.limit_bar(ui, key, level);
+        self.limit_bar(ui, format::effective_remaining(key), stale);
         ui.add_space(10.0);
         self.cards(ui, key);
         ui.add_space(10.0);
@@ -339,18 +359,22 @@ impl App {
         self.credits_block(ui, snap);
     }
 
-    fn limit_bar(&self, ui: &mut egui::Ui, key: &KeyInfo, level: Level) {
-        let spent = period_spent(key);
-        match spent_pct(key.limit, spent) {
-            Some(pct) => {
-                let bar = egui::ProgressBar::new((pct / 100.0) as f32)
+    fn limit_bar(&self, ui: &mut egui::Ui, limit: Option<RemainingLimit>, stale: bool) {
+        match limit {
+            Some(limit) => {
+                let level = if stale {
+                    Level::Error
+                } else {
+                    format::level_for_fraction(Some(limit.fraction))
+                };
+                let bar = egui::ProgressBar::new((1.0 - limit.fraction) as f32)
                     .desired_width(ui.available_width())
                     .desired_height(18.0)
                     .fill(level_color(level))
                     .animate(false);
                 ui.add(bar);
                 ui.add_space(2.0);
-                ui.label(RichText::new(spent_caption(key.limit, spent)).strong());
+                ui.label(RichText::new(spent_caption(limit)).strong());
             }
             None => {
                 ui.label(RichText::new("Лимит: без лимита").weak());
@@ -360,11 +384,13 @@ impl App {
 
     fn cards(&self, ui: &mut egui::Ui, key: &KeyInfo) {
         let remaining = format::key_remaining(key);
-        // Цвет карточки «Остаток»: тот же уровень, что у трея и кнопки панели задач.
+        // Карточка показывает остаток самого ключа, независимо от бюджета.
         let rem_color = if remaining_is_negative(remaining) {
             level_color(Level::Red)
         } else {
-            level_color(format::level_for_fraction(format::remaining_fraction(key)))
+            level_color(format::level_for_fraction(
+                format::key_limit(key).map(|limit| limit.fraction),
+            ))
         };
         let big = |ui: &mut egui::Ui, value: String, color: Option<Color32>| {
             let text = RichText::new(value).size(24.0).strong().monospace();
@@ -389,8 +415,8 @@ impl App {
                     );
                 };
                 col("Потрачено", format::money(key.usage), None);
-                col("Остаток", remaining_text(remaining), Some(rem_color));
-                col("Лимит", limit_text(key.limit), None);
+                col("Остаток ключа", remaining_text(remaining), Some(rem_color));
+                col("Лимит ключа", limit_text(key.limit), None);
             });
         });
     }
@@ -466,9 +492,8 @@ impl App {
         let Some(mut draft) = self.settings.take() else {
             return;
         };
-        let mut close = false;
-        // Иконка действия для `MgmtKeyChange`: `1` задать новый ключ, иначе не менять/удалить.
-        let mut action: i8 = 0;
+        let mut action = SettingsAction::ContinueEditing;
+        let demo = self.core.is_demo();
 
         egui::Window::new("Настройки")
             .collapsible(false)
@@ -517,7 +542,10 @@ impl App {
                 ui.label(RichText::new("0 % — уведомления выключены.").small().weak());
 
                 ui.add_space(6.0);
-                ui.checkbox(&mut draft.cfg.autostart, "Запускать с Windows");
+                ui.add_enabled(
+                    !demo,
+                    egui::Checkbox::new(&mut draft.cfg.autostart, "Запускать с Windows"),
+                );
                 ui.checkbox(
                     &mut draft.cfg.start_minimized,
                     "Запускаться свёрнутым в трей",
@@ -562,13 +590,6 @@ impl App {
                     }
                 }
                 draft.cfg.tray_sources = sources;
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("Остальные суммы всегда видны во всплывающей подсказке иконки")
-                        .small()
-                        .weak(),
-                );
-
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label(RichText::new("Management-ключ").small().strong());
@@ -578,7 +599,8 @@ impl App {
                 if state.has_management_key {
                     ui.label(RichText::new("ключ сохранён").small().weak());
                 }
-                ui.add(
+                ui.add_enabled(
+                    !demo,
                     egui::TextEdit::singleline(&mut draft.mgmt)
                         .password(true)
                         .hint_text("оставьте пустым, чтобы не менять")
@@ -588,7 +610,9 @@ impl App {
                     if draft.remove_mgmt {
                         ui.label(RichText::new("ключ будет удалён после «Сохранить»").small());
                     } else if state.has_management_key
-                        && ui.button("Удалить management-ключ").clicked()
+                        && ui
+                            .add_enabled(!demo, egui::Button::new("Удалить management-ключ"))
+                            .clicked()
                     {
                         draft.remove_mgmt = true;
                         draft.mgmt.clear();
@@ -607,63 +631,54 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Сохранить").clicked() {
-                        action = if draft.mgmt.trim().is_empty() { 0 } else { 1 };
-                        close = true;
+                        action = SettingsAction::Save;
                     }
                     if ui.button("Отмена").clicked() {
-                        close = true;
+                        action = SettingsAction::Cancel;
                     }
                 });
             });
 
-        if !close {
-            self.settings = Some(draft);
-            return;
-        }
-
-        // Введённый новый ключ важнее нажатого ранее «Удалить».
-        let change = if action == 1 {
-            MgmtKeyChange::Set(draft.mgmt.trim().to_string())
-        } else if draft.remove_mgmt {
-            MgmtKeyChange::Clear
-        } else {
-            MgmtKeyChange::Keep
-        };
-        // Ключ стирается из черновика сразу после передачи ядру.
-        draft.mgmt.clear();
-        match self.core.apply_settings(draft.cfg.clone(), change) {
-            Ok(()) => self.settings = None,
-            Err(e) => {
-                draft.error = Some(e);
-                self.settings = Some(draft);
-            }
-        }
+        self.settings = draft.finish(action, |cfg, change| self.core.apply_settings(cfg, change));
     }
 }
 
 impl eframe::App for App {
+    /// Вызывается и когда окно скрыто или свёрнуто (тогда `ui` не рисуется).
+    /// Поэтому крестик и сворачивание обрабатываются здесь: иначе при свёрнутом
+    /// окне команды скрытия никто не отправит.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.core.has_tray() {
+            return;
+        }
+        // Закрытие окна (крестик) не завершает приложение: живём в трее.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        // Сворачивание окна тоже уводит приложение в трей.
+        if ctx.input(|i| i.viewport().minimized == Some(true)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let state = self.state();
 
-        if self.core.take_start_hidden() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if self.start_hidden {
+            // eframe показывает окно после отрисовки первого кадра.
+            if ctx.cumulative_frame_nr() == 0 {
+                ctx.request_repaint();
+            } else {
+                self.start_hidden = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
         if self.core.take_open_settings() {
             self.open_settings();
         }
-
-        // Закрытие окна (крестик) не завершает приложение: живём в трее.
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && self.core.has_tray() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
-        let level = match state.phase {
-            AuthPhase::Ready => TaskbarModel::from_state(&state).level,
-            _ => Level::Unknown,
-        };
 
         egui::Panel::top("ui_top").show(ui, |ui| {
             ui.add_space(2.0);
@@ -682,7 +697,8 @@ impl eframe::App for App {
                 if ui.button("Настройки").clicked() {
                     self.open_settings();
                 }
-                if ui.button("Выйти").clicked() {
+                if !self.core.is_demo() && ui.button("Выйти").clicked() {
+                    self.settings = None;
                     self.core.logout();
                 }
             });
@@ -700,7 +716,7 @@ impl eframe::App for App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match state.phase {
                     AuthPhase::SignedOut | AuthPhase::LoggingIn => self.login_screen(ui, &state),
-                    AuthPhase::Ready => self.main_screen(ui, &state, level),
+                    AuthPhase::Ready => self.main_screen(ui, &state),
                 });
         });
 
@@ -709,11 +725,6 @@ impl eframe::App for App {
         if self.hide_requested {
             self.hide_requested = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
-        // Окно видимо: перерисовка раз в секунду — «Обновлено HH:MM:SS» и статус.
-        if ctx.input(|i| i.viewport().visible()).unwrap_or(true) {
-            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 }
@@ -746,57 +757,54 @@ mod tests {
     }
 
     #[test]
-    fn period_spent_uses_remaining_when_known() {
+    fn spent_caption_uses_remaining_for_current_period() {
         // Лимит сбрасывается по периоду: за всё время $90, в этом периоде $10.
-        assert_eq!(period_spent(&key(Some(50.0), Some(40.0), 90.0)), 10.0);
-        // Остаток неизвестен — расход за всё время.
-        assert_eq!(period_spent(&key(Some(50.0), None, 12.5)), 12.5);
-        assert_eq!(period_spent(&key(None, None, 7.0)), 7.0);
-    }
-
-    #[test]
-    fn spent_pct_basic() {
-        assert_eq!(spent_pct(Some(50.0), 12.5), Some(25.0));
-        assert_eq!(spent_pct(Some(100.0), 0.0), Some(0.0));
-        assert_eq!(spent_pct(Some(10.0), 10.0), Some(100.0));
-    }
-
-    #[test]
-    fn spent_pct_no_limit_or_zero_limit() {
-        assert_eq!(spent_pct(None, 7.0), None);
-        assert_eq!(spent_pct(Some(0.0), 7.0), None);
-        assert_eq!(spent_pct(Some(-5.0), 7.0), None);
-        assert_eq!(spent_pct(Some(f64::NAN), 7.0), None);
-        assert_eq!(spent_pct(Some(10.0), f64::NAN), None);
-    }
-
-    #[test]
-    fn spent_pct_clamps_over_and_under() {
-        // перерасход >100% показываем как 100%
-        assert_eq!(spent_pct(Some(10.0), 15.0), Some(100.0));
         assert_eq!(
-            spent_caption(Some(10.0), 15.0),
-            "Потрачено $15.00 из $10.00 (100%)"
+            spent_caption(format::key_limit(&key(Some(50.0), Some(40.0), 90.0)).unwrap()),
+            "Потрачено $10.00 из $50.00 (20%)"
         );
     }
 
     #[test]
-    fn spent_caption_no_limit_has_no_percent() {
-        assert_eq!(spent_caption(None, 7.26), "Потрачено $7.26");
-        assert_eq!(spent_caption(Some(0.0), 7.26), "Потрачено $7.26");
-        assert!(!spent_caption(None, 1.0).contains('%'));
+    fn spent_caption_handles_overspending_and_zero_limit() {
+        assert_eq!(
+            spent_caption(format::key_limit(&key(Some(10.0), None, 15.0)).unwrap()),
+            "Потрачено $15.00 из $10.00 (100%)"
+        );
+        assert_eq!(
+            spent_caption(format::key_limit(&key(Some(0.0), Some(0.0), 0.0)).unwrap()),
+            "Потрачено $0.00 из $0.00 (100%)"
+        );
     }
 
     #[test]
     fn spent_caption_rounds_percent() {
         assert_eq!(
-            spent_caption(Some(50.0), 37.6),
+            spent_caption(format::key_limit(&key(Some(50.0), None, 37.6)).unwrap()),
             "Потрачено $37.60 из $50.00 (75%)"
         );
         assert_eq!(
-            spent_caption(Some(3.0), 1.0),
+            spent_caption(format::key_limit(&key(Some(3.0), None, 1.0)).unwrap()),
             "Потрачено $1.00 из $3.00 (33%)"
         );
+    }
+
+    #[test]
+    fn cancel_settings_discards_changes_and_pending_key_removal() {
+        let draft = SettingsDraft {
+            cfg: Config {
+                refresh_secs: MAX_REFRESH_SECS,
+                autostart: true,
+                ..Config::default()
+            },
+            mgmt: String::new(),
+            remove_mgmt: true,
+            error: None,
+        };
+        let next = draft.finish(SettingsAction::Cancel, |_, _| {
+            panic!("отмена не должна сохранять настройки или удалять ключ")
+        });
+        assert!(next.is_none());
     }
 
     #[test]
@@ -887,7 +895,7 @@ mod tests {
         assert!(show_toolbar(AuthPhase::Ready));
         assert_eq!(limit_text(Some(50.0)), "$50.00");
         assert_eq!(limit_text(None), "без лимита");
-        assert_eq!(limit_text(Some(0.0)), "без лимита");
+        assert_eq!(limit_text(Some(0.0)), "$0.00");
     }
 
     #[test]

@@ -499,13 +499,6 @@ pub fn delete_key(kind: KeyKind) -> Result<(), AuthError> {
     delete_key_in(KEYRING_SERVICE, kind)
 }
 
-/// Удаляет все ключи (кнопка «Выйти»).
-pub fn delete_all() -> Result<(), AuthError> {
-    let main = delete_key_in(KEYRING_SERVICE, KeyKind::Main);
-    let management = delete_key_in(KEYRING_SERVICE, KeyKind::Management);
-    main.and(management)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
