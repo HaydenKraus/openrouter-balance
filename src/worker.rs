@@ -13,7 +13,10 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::api::{ApiError, Client, CreditsStatus, KeyInfo, Snapshot};
+use crate::api::{
+    top_models, AccountKey, ApiError, Client, CreditsStatus, KeyInfo, ModelUsage,
+    Snapshot,
+};
 use crate::auth::{self, KeyKind};
 use crate::config::Config;
 use crate::format::{effective_remaining, money, LimitSource, RemainingLimit, TaskbarModel};
@@ -26,6 +29,8 @@ const ERROR_RETRY_SECS: u64 = 20;
 const ERROR_MAX_WAIT_SECS: u64 = 600;
 const CREDITS_DENIED_RETRY: Duration = Duration::from_secs(600);
 const MAX_WAIT_SLICE: Duration = Duration::from_secs(3600);
+/// Сколько моделей показывать в сводке активности.
+const MAX_ACTIVITY_MODELS: usize = 8;
 
 /// Изменение management-ключа в настройках.
 pub enum MgmtKeyChange {
@@ -67,6 +72,22 @@ impl NotifyTracker {
     }
 }
 
+/// Данные аккаунта для окна «Ключи и активность» (management-ключ).
+#[derive(Debug, Clone, Default)]
+pub struct AccountData {
+    /// `true` — запросы идут прямо сейчас.
+    pub loading: bool,
+    /// Список ключей аккаунта (`GET /keys`).
+    pub keys: Vec<AccountKey>,
+    pub keys_error: Option<String>,
+    /// Топ моделей за 30 суток (`GET /activity`).
+    pub models: Vec<ModelUsage>,
+    pub total: ModelUsage,
+    pub activity_error: Option<String>,
+    /// management-ключ не задан — запросы не отправлялись.
+    pub needs_management_key: bool,
+}
+
 struct Session {
     state: AppState,
     main_key: Option<String>,
@@ -76,6 +97,8 @@ struct Session {
     credits_generation: u64,
     credits: CreditsStatus,
     notify: NotifyTracker,
+    account: AccountData,
+    account_loaded: bool,
 }
 
 impl Default for Session {
@@ -89,6 +112,8 @@ impl Default for Session {
             credits_generation: 0,
             credits: CreditsStatus::Unavailable,
             notify: NotifyTracker::default(),
+            account: AccountData::default(),
+            account_loaded: false,
         }
     }
 }
@@ -361,6 +386,72 @@ impl Core {
         self.request_repaint();
     }
 
+    /// Данные аккаунта для окна «Ключи и активность».
+    pub fn account(&self) -> AccountData {
+        lock(&self.session).account.clone()
+    }
+
+    /// Запросить ключи аккаунта и активность за 30 суток (management-ключ).
+    /// Повторный вызов без `force` использует уже загруженные данные.
+    pub fn load_account(self: &Arc<Self>, force: bool) {
+        let mgmt = {
+            let session = lock(&self.session);
+            if !force && (session.account_loaded || session.account.loading) {
+                return;
+            }
+            session.mgmt_key.clone()
+        };
+        let Some(mgmt) = mgmt else {
+            let mut session = lock(&self.session);
+            session.account = AccountData {
+                needs_management_key: true,
+                ..Default::default()
+            };
+            session.account_loaded = false;
+            drop(session);
+            self.request_repaint();
+            return;
+        };
+        {
+            let mut session = lock(&self.session);
+            let account = &mut session.account;
+            account.loading = true;
+            account.keys_error = None;
+            account.activity_error = None;
+            account.needs_management_key = false;
+        }
+        self.request_repaint();
+        let me = self.clone();
+        self.rt.spawn(async move {
+            let keys = me.client.fetch_keys(&mgmt).await;
+            let activity = me.client.fetch_activity(&mgmt).await;
+            {
+                let mut session = lock(&me.session);
+                let account = &mut session.account;
+                account.loading = false;
+                match keys {
+                    Ok(list) => {
+                        account.keys = list;
+                        account.keys_error = None;
+                    }
+                    Err(e) => account.keys_error = Some(e.to_string()),
+                }
+                match activity {
+                    Ok(items) => {
+                        let (models, total) = top_models(&items, MAX_ACTIVITY_MODELS);
+                        account.models = models;
+                        account.total = total;
+                        account.activity_error = None;
+                    }
+                    Err(e) => account.activity_error = Some(e.to_string()),
+                }
+                session.account_loaded =
+                    account.keys_error.is_none() && account.activity_error.is_none();
+            }
+            me.request_repaint();
+        });
+    }
+
     /// Немедленное обновление (кнопка «Обновить»). Не блокирует.
     pub fn refresh_now(&self) {
         self.wake.notify_one();
@@ -539,6 +630,9 @@ impl Core {
                 session.credits_generation += 1;
                 session.state.has_management_key = session.mgmt_key.is_some();
                 session.set_credits(CreditsStatus::Unavailable);
+                // Список ключей и активность зависят от management-ключа — перезапросим.
+                session.account_loaded = false;
+                session.account = AccountData::default();
             }
         }
 

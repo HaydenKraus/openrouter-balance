@@ -10,6 +10,9 @@ use crate::format::{self, Level, LimitSource, RemainingLimit};
 use crate::state::{AppState, AuthPhase, ErrorKind};
 use crate::worker::{Core, MgmtKeyChange};
 
+/// Сколько ключей показывать в окне «Ключи и активность».
+const MAX_ACCOUNT_ROWS: usize = 8;
+
 /// Заголовок окна (само окно подписывает Win32-слой — тултип миниатюры панели задач).
 pub const WINDOW_TITLE: &str = "OpenRouter Баланс";
 
@@ -134,6 +137,28 @@ pub fn tray_click_allowed(selected: usize, wanted_on: bool) -> bool {
     }
 }
 
+/// Число с разделителями разрядов: 1 510 972 250.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Дата-время последнего вызова ключа: из ISO-строки берём «YYYY-MM-DD HH:MM».
+fn last_used(value: Option<&str>) -> String {
+    match value {
+        Some(s) if s.len() >= 16 => s[..16].replace('T', " "),
+        Some(s) => s.to_string(),
+        None => "—".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Приложение
 // ---------------------------------------------------------------------------
@@ -191,6 +216,8 @@ pub struct App {
     start_hidden: bool,
     /// Запрошенное скрытие окна (обрабатывается в конце кадра).
     hide_requested: bool,
+    /// Открыто окно «Ключи и активность».
+    show_account: bool,
 }
 
 impl App {
@@ -203,6 +230,7 @@ impl App {
             settings: None,
             start_hidden,
             hide_requested: false,
+            show_account: false,
         }
     }
 
@@ -493,6 +521,177 @@ impl App {
 
     // -- настройки ----------------------------------------------------------
 
+    /// Окно «Ключи и активность»: то же, что показывает сайт OpenRouter
+    /// (список ключей и расход по моделям за 30 суток). Нужен management-ключ.
+    ///
+    /// Вёрстка подстраивается под ширину окна: длинные имена обрезаются
+    /// многоточием, полос прокрутки и текста за краем нет.
+    fn account_window(&mut self, ctx: &egui::Context) {
+        if !self.show_account {
+            return;
+        }
+        let data = self.core.account();
+        let mut open = true;
+        let mut want_settings = false;
+        // Ширина рамки окна чуть меньше главного окна — ничего не вылезает за край.
+        let width = (ctx.content_rect().width() - 40.0).max(300.0);
+        egui::Window::new("Ключи и активность")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(width)
+            .max_width(width)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let avail = ui.available_width();
+                ui.set_max_width(avail);
+                if data.needs_management_key {
+                    ui.label("Ключи аккаунта и расход по моделям запрашиваются management-ключом.");
+                    ui.label(
+                        RichText::new(
+                            "Ключ создаётся на openrouter.ai/settings/management-keys и вводится \
+                             в «Настройках». API отдаёт только названия и суммы ключей — сами \
+                             секреты недоступны, поэтому ключ для запросов вводится вручную.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if ui.button("Открыть настройки").clicked() {
+                        want_settings = true;
+                    }
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Ключи аккаунта").strong());
+                    if data.loading {
+                        ui.spinner();
+                    }
+                    ui.label(
+                        RichText::new(format!("найдено: {}", data.keys.len()))
+                            .small()
+                            .weak(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Обновить").clicked() {
+                            self.core.load_account(true);
+                        }
+                    });
+                });
+                if let Some(err) = &data.keys_error {
+                    ui.colored_label(level_color(Level::Red), err.as_str());
+                }
+                // Строка на ключ: имя строкой, суммы — второй строкой. Колонок нет,
+                // поэтому узкое окно ничего не обрезает.
+                for key in data.keys.iter().take(MAX_ACCOUNT_ROWS) {
+                    let mut title = key.title();
+                    if key.disabled {
+                        title.push_str(" (отключён)");
+                    }
+                    ui.add(
+                        egui::Label::new(RichText::new(title).strong())
+                            .truncate()
+                            .sense(egui::Sense::hover()),
+                    );
+                    let limit = match (key.limit, key.limit_remaining) {
+                        (Some(limit), Some(rest)) => {
+                            format!("лимит {} из {}", format::money(rest), format::money(limit))
+                        }
+                        (Some(limit), None) => format!("лимит {}", format::money(limit)),
+                        _ => "без лимита".to_string(),
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · потрачено {} · вызов {}",
+                            limit,
+                            format::money(key.usage),
+                            last_used(key.last_used_at.as_deref())
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                if data.keys.len() > MAX_ACCOUNT_ROWS {
+                    ui.label(
+                        RichText::new(format!("и ещё {} ключей", data.keys.len() - MAX_ACCOUNT_ROWS))
+                            .small()
+                            .weak(),
+                    );
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.label(RichText::new("Расход за 30 суток").strong());
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} запросов · {} токенов",
+                        format::money(data.total.usage),
+                        grouped(data.total.requests),
+                        grouped(data.total.tokens)
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if let Some(err) = &data.activity_error {
+                    ui.colored_label(level_color(Level::Red), err.as_str());
+                }
+                if data.models.is_empty() {
+                    if !data.loading && data.activity_error.is_none() {
+                        ui.label(RichText::new("За 30 суток активности нет.").weak().small());
+                    }
+                    return;
+                }
+                // Колонки фиксированной ширины, имя модели занимает остаток и обрезается.
+                let money_w = 62.0;
+                let share_w = 38.0;
+                let req_w = 52.0;
+                let name_w = (avail - money_w - share_w - req_w - 24.0).max(80.0);
+                let total = data.total.usage.max(f64::MIN_POSITIVE);
+                egui::Grid::new("account_models")
+                    .num_columns(4)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        for (title, w) in [
+                            ("Модель", name_w),
+                            ("Расход", money_w),
+                            ("Доля", share_w),
+                            ("Запросов", req_w),
+                        ] {
+                            ui.add_sized(
+                                [w, 14.0],
+                                egui::Label::new(RichText::new(title).small().strong()).truncate(),
+                            );
+                        }
+                        ui.end_row();
+                        for row in &data.models {
+                            ui.add_sized(
+                                [name_w, 18.0],
+                                egui::Label::new(row.model.as_str()).truncate(),
+                            );
+                            ui.add_sized(
+                                [money_w, 18.0],
+                                egui::Label::new(format::money(row.usage)).truncate(),
+                            );
+                            ui.add_sized(
+                                [share_w, 18.0],
+                                egui::Label::new(format!("{:.0}%", row.usage / total * 100.0))
+                                    .truncate(),
+                            );
+                            ui.add_sized(
+                                [req_w, 18.0],
+                                egui::Label::new(grouped(row.requests)).truncate(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.show_account = open;
+        if want_settings {
+            self.show_account = false;
+            self.open_settings();
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context, state: &AppState) {
         let Some(mut draft) = self.settings.take() else {
             return;
@@ -698,7 +897,14 @@ impl eframe::App for App {
                     self.core.refresh_now();
                 }
                 if ui.button("Настройки").clicked() {
+                    // Два окна одновременно перекрывали друг друга.
+                    self.show_account = false;
                     self.open_settings();
+                }
+                if !self.core.is_demo() && ui.button("Ключи").clicked() {
+                    self.settings = None;
+                    self.show_account = true;
+                    self.core.load_account(false);
                 }
                 if !self.core.is_demo() && ui.button("Выйти").clicked() {
                     self.settings = None;
@@ -724,6 +930,7 @@ impl eframe::App for App {
         });
 
         self.settings_window(&ctx, &state);
+        self.account_window(&ctx);
 
         if self.hide_requested {
             self.hide_requested = false;

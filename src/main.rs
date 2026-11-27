@@ -91,8 +91,8 @@ fn main() {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(ui::WINDOW_TITLE)
-        .with_inner_size([470.0, 640.0])
-        .with_min_inner_size([400.0, 460.0]);
+        .with_inner_size([520.0, 760.0])
+        .with_min_inner_size([420.0, 660.0]);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }

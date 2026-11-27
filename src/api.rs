@@ -95,6 +95,125 @@ pub fn parse_credits(body: &str) -> Result<Credits, ApiError> {
         .map_err(|e| ApiError::Parse(e.to_string()))
 }
 
+/// Один ключ аккаунта из `GET /keys` (нужен management-ключ).
+/// Сам ключ API не отдаёт — только хэш и статистику.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct AccountKey {
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// `None` — у ключа нет лимита.
+    #[serde(default)]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub limit_remaining: Option<f64>,
+    #[serde(default)]
+    pub usage: f64,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+}
+
+impl AccountKey {
+    /// Имя для списка: `name`, иначе `label`, иначе хвост хэша.
+    pub fn title(&self) -> String {
+        self.name
+            .as_deref()
+            .or(self.label.as_deref())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("ключ {}", self.short_hash()))
+    }
+
+    /// Первые 8 символов хэша — чтобы отличать ключи-тёзки.
+    pub fn short_hash(&self) -> String {
+        self.hash.chars().take(8).collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KeysEnvelope {
+    data: Vec<AccountKey>,
+}
+
+/// Разбор тела ответа `/keys`.
+pub fn parse_keys(body: &str) -> Result<Vec<AccountKey>, ApiError> {
+    serde_json::from_str::<KeysEnvelope>(body)
+        .map(|e| e.data)
+        .map_err(|e| ApiError::Parse(e.to_string()))
+}
+
+/// Строка `GET /activity`: расход по модели за день (последние 30 суток).
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct ActivityItem {
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub usage: f64,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityEnvelope {
+    data: Vec<ActivityItem>,
+}
+
+/// Разбор тела ответа `/activity`.
+pub fn parse_activity(body: &str) -> Result<Vec<ActivityItem>, ApiError> {
+    serde_json::from_str::<ActivityEnvelope>(body)
+        .map(|e| e.data)
+        .map_err(|e| ApiError::Parse(e.to_string()))
+}
+
+/// Сводка по одной модели за период.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelUsage {
+    pub model: String,
+    pub requests: u64,
+    pub tokens: u64,
+    pub usage: f64,
+}
+
+/// Суммы по моделям из строк активности: (топ по расходу, итог по всем).
+pub fn top_models(items: &[ActivityItem], limit: usize) -> (Vec<ModelUsage>, ModelUsage) {
+    use std::collections::HashMap;
+    let mut by_model: HashMap<&str, ModelUsage> = HashMap::new();
+    let mut total = ModelUsage::default();
+    for item in items {
+        let row = by_model.entry(item.model.as_str()).or_insert_with(|| ModelUsage {
+            model: item.model.clone(),
+            ..Default::default()
+        });
+        let tokens = item.prompt_tokens + item.completion_tokens;
+        row.requests += item.requests;
+        row.tokens += tokens;
+        row.usage += item.usage;
+        total.requests += item.requests;
+        total.tokens += tokens;
+        total.usage += item.usage;
+    }
+    let mut rows: Vec<ModelUsage> = by_model.into_values().collect();
+    rows.sort_by(|a, b| {
+        b.usage
+            .partial_cmp(&a.usage)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    rows.truncate(limit);
+    (rows, total)
+}
+
 /// Ошибки API. Тексты никогда не содержат ключей.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
@@ -284,6 +403,18 @@ impl Client {
     /// `GET /credits`. 403 → `Err(ApiError::Forbidden)`.
     pub async fn fetch_credits(&self, key: &str) -> Result<Credits, ApiError> {
         self.fetch_with_retries("/credits", key, parse_credits)
+            .await
+    }
+
+    /// `GET /keys` — все ключи аккаунта (нужен management-ключ).
+    pub async fn fetch_keys(&self, key: &str) -> Result<Vec<AccountKey>, ApiError> {
+        self.fetch_with_retries("/keys?include_disabled=true", key, parse_keys)
+            .await
+    }
+
+    /// `GET /activity` — расход по моделям за последние 30 суток (management-ключ).
+    pub async fn fetch_activity(&self, key: &str) -> Result<Vec<ActivityItem>, ApiError> {
+        self.fetch_with_retries("/activity", key, parse_activity)
             .await
     }
 
@@ -981,6 +1112,50 @@ mod tests {
 
         let error = parse_err(test_client(&format!("http://{addr}")).fetch_key("k").await);
         assert!(matches!(error, ApiError::Network(_)), "{error:?}");
+    }
+
+    #[test]
+    fn keys_response_parses_names_limits_and_disabled() {
+        let body = r#"{"data":[
+            {"hash":"f01d52606dc8f0a8","name":"Hermes","limit":50,"limit_remaining":12.5,"usage":37.5,"disabled":false,"last_used_at":"2026-11-27T19:05:00Z"},
+            {"hash":"aa11bb22cc33dd44","label":"Старый","usage":3.0,"disabled":true}
+        ]}"#;
+        let keys = parse_keys(body).expect("keys parsed");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].title(), "Hermes");
+        assert_eq!(keys[0].short_hash(), "f01d5260");
+        assert_eq!((keys[0].limit, keys[0].limit_remaining), (Some(50.0), Some(12.5)));
+        // Второй ключ без лимита и выключен, имя берётся из label.
+        assert_eq!(keys[1].title(), "Старый");
+        assert_eq!(keys[1].limit, None);
+        assert!(keys[1].disabled);
+        // Пустой список — не ошибка.
+        assert!(parse_keys(r#"{"data":[]}"#).unwrap().is_empty());
+        assert!(matches!(parse_keys(r#"{"nope":1}"#), Err(ApiError::Parse(_))));
+    }
+
+    #[test]
+    fn activity_response_aggregates_by_model() {
+        let body = r#"{"data":[
+            {"date":"2026-11-26","model":"openai/gpt-4.1","usage":0.5,"requests":4,"prompt_tokens":100,"completion_tokens":50},
+            {"date":"2026-11-27","model":"openai/gpt-4.1","usage":0.25,"requests":2,"prompt_tokens":60,"completion_tokens":40},
+            {"date":"2026-11-27","model":"deepseek/deepseek-chat","usage":1.5,"requests":3,"prompt_tokens":10,"completion_tokens":20}
+        ]}"#;
+        let items = parse_activity(body).expect("activity parsed");
+        assert_eq!(items.len(), 3);
+        let (top, total) = top_models(&items, 8);
+        // Сортировка по расходу: дорогая модель первой.
+        assert_eq!(top[0].model, "deepseek/deepseek-chat");
+        assert_eq!(top[1].model, "openai/gpt-4.1");
+        // Строки одной модели складываются.
+        assert_eq!(top[1].requests, 6);
+        assert_eq!(top[1].tokens, 250);
+        assert!((top[1].usage - 0.75).abs() < 1e-9);
+        assert_eq!(total.requests, 9);
+        assert!((total.usage - 2.25).abs() < 1e-9);
+        // Лимит строк соблюдается.
+        assert_eq!(top_models(&items, 1).0.len(), 1);
+        assert!(parse_activity(r#"{"data":[]}"#).unwrap().is_empty());
     }
 
     #[tokio::test]
